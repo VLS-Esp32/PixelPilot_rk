@@ -53,7 +53,7 @@ int process_rx(const msgpack::object& packet) {
             packets = packet.via.map.ptr[i].val;
         } else if (key == "rx_ant_stats") {
             rx_ant_stats = packet.via.map.ptr[i].val;
-            ant_count = rx_ant_stats.via.map.size
+            ant_count = rx_ant_stats.via.map.size;
         }
     }
 
