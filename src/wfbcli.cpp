@@ -38,6 +38,10 @@ int process_rx(const msgpack::object& packet) {
     std::string id;
     msgpack::object packets;
     msgpack::object rx_ant_stats;
+    
+    int64_t total_rssi_avg = 0;
+    int64_t total_snr_avg = 0;
+    size_t ant_count = rx_ant_stats.via.map.size;
 
     for (size_t i = 0; i < packet.via.map.size; ++i) {
         std::string key = packet.via.map.ptr[i].key.as<std::string>();
@@ -65,7 +69,7 @@ int process_rx(const msgpack::object& packet) {
     }
 
     // Process rx_ant_stats
-    for (size_t i = 0; i < rx_ant_stats.via.map.size; ++i) {
+    for (size_t i = 0; i < ant_count; ++i) {
         // Extract the key (which is an array: [[frequency, mcs, bandwidth], antenna_id])
         msgpack::object_array key_array = rx_ant_stats.via.map.ptr[i].key.via.array;
 
@@ -93,6 +97,10 @@ int process_rx(const msgpack::object& packet) {
         int32_t snr_min = value_array.ptr[4].as<int32_t>();
         int32_t snr_avg = value_array.ptr[5].as<int32_t>();
         int32_t snr_max = value_array.ptr[6].as<int32_t>();
+
+        total_rssi_avg += rssi_avg;
+        total_snr_avg += snr_avg;
+
         osd_add_uint_fact(batch, "wfbcli.rx.ant_stats.freq", tags, 2, frequency);
         osd_add_uint_fact(batch, "wfbcli.rx.ant_stats.mcs", tags, 2, mcs);
         osd_add_uint_fact(batch, "wfbcli.rx.ant_stats.bw", tags, 2, bandwidth);
@@ -103,6 +111,13 @@ int process_rx(const msgpack::object& packet) {
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_min", tags, 2, snr_min);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg", tags, 2, snr_avg);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_max", tags, 2, snr_max);
+    }
+
+    if (ant_count > 0) {
+        int32_t avg_rssi = total_rssi_avg / (int32_t)ant_count;
+        int32_t avg_snr = total_snr_avg / (int32_t)ant_count;
+        osd_add_int_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_global", tags, 1, avg_rssi);
+        osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_global", tags, 1, avg_snr);
     }
 
     osd_publish_batch(batch);
