@@ -41,7 +41,7 @@ int process_rx(const msgpack::object& packet) {
     
     int64_t total_rssi_avg = 0;
     int64_t total_snr_avg = 0;
-    size_t ant_count = rx_ant_stats.via.map.size;
+    size_t ant_count = 0;
 
     for (size_t i = 0; i < packet.via.map.size; ++i) {
         std::string key = packet.via.map.ptr[i].key.as<std::string>();
@@ -53,6 +53,7 @@ int process_rx(const msgpack::object& packet) {
             packets = packet.via.map.ptr[i].val;
         } else if (key == "rx_ant_stats") {
             rx_ant_stats = packet.via.map.ptr[i].val;
+            ant_count = rx_ant_stats.via.map.size
         }
     }
 
