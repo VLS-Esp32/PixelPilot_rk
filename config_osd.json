@@ -39,7 +39,7 @@
       "per_second_window_s": 2,
       "per_second_bucket_ms": 100,
       "facts": [
-        { "name": "wfbcli.rx.ant_stats.snr_avg_global" }
+        { "name": "wfbcli.rx.ant_stats.snr_avg_best" }
       ]
     },
     {
@@ -51,7 +51,7 @@
       "per_second_window_s": 2,
       "per_second_bucket_ms": 100,
       "facts": [
-        { "name": "wfbcli.rx.ant_stats.rssi_avg_global" }
+        { "name": "wfbcli.rx.ant_stats.rssi_avg_best" }
       ]
     },
     {

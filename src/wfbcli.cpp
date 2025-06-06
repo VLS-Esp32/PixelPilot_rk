@@ -42,6 +42,8 @@ int process_rx(const msgpack::object& packet) {
     int64_t total_rssi_avg = 0;
     int64_t total_snr_avg = 0;
     size_t ant_count = 0;
+    int32_t best_rssi_avg = -130;
+    int32_t best_snr_avg = 0;
 
     for (size_t i = 0; i < packet.via.map.size; ++i) {
         std::string key = packet.via.map.ptr[i].key.as<std::string>();
@@ -102,6 +104,13 @@ int process_rx(const msgpack::object& packet) {
         total_rssi_avg += rssi_avg;
         total_snr_avg += snr_avg;
 
+        if (rssi_avg > best_rssi_avg) {
+            best_rssi_avg = rssi_avg;
+        }
+        if (snr_avg > best_snr_avg) {
+            best_snr_avg = snr_avg;
+        }
+
         osd_add_uint_fact(batch, "wfbcli.rx.ant_stats.freq", tags, 2, frequency);
         osd_add_uint_fact(batch, "wfbcli.rx.ant_stats.mcs", tags, 2, mcs);
         osd_add_uint_fact(batch, "wfbcli.rx.ant_stats.bw", tags, 2, bandwidth);
@@ -119,6 +128,8 @@ int process_rx(const msgpack::object& packet) {
         int32_t avg_snr = total_snr_avg / (int32_t)ant_count;
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_global", tags, 1, avg_rssi);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_global", tags, 1, avg_snr);
+        osd_add_int_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_best", tags, 1, best_rssi_avg);
+        osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_best", tags, 1, best_snr_avg);
     }
 
     osd_publish_batch(batch);
