@@ -68,8 +68,8 @@
     {
       "name": "msposd",
       "type": "ExternalSurfaceWidget",
-      "x": 0,
-      "y": 0,
+      "x": 80,
+      "y": 80,
       "width": 0,
       "height": 0,
       "facts": []
