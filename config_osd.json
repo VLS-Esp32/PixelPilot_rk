@@ -1,0 +1,78 @@
+{
+  "format": "0.0.1",
+  "assets_dir": "/usr/local/share/pixelpilot/",
+  "widgets": [
+    {
+      "name": "Video FPS and resolution",
+      "type": "VideoWidget",
+      "x": 20,
+      "y": -24,
+      "icon_path": "framerate.png",
+      "template": "%u fps | %ux%u",
+      "per_second_window_s": 2,
+      "per_second_bucket_ms": 200,
+      "facts": [
+        { "name": "video.displayed_frame" },
+        { "name": "video.width" },
+        { "name": "video.height" }
+      ]
+    },
+    {
+      "name": "Video link throughput",
+      "type": "VideoBitrateWidget",
+      "x": 280,
+      "y": -24,
+      "icon_path": "network.png",
+      "template": "%f Mbps",
+      "per_second_window_s": 2,
+      "per_second_bucket_ms": 100,
+      "facts": [
+        { "name": "gstreamer.received_bytes" }
+      ]
+    },
+    {
+      "name": "Signal SNR",
+      "type": "TplTextWidget",
+      "x": 500,
+      "y": -24,
+      "template": "SNR: %i dB",
+      "per_second_window_s": 2,
+      "per_second_bucket_ms": 100,
+      "facts": [
+        { "name": "wfbcli.rx.ant_stats.snr_avg_best" }
+      ]
+    },
+    {
+      "name": "Signal RSSI",
+      "type": "TplTextWidget",
+      "x": 650,
+      "y": -24,
+      "template": "RSSI: %i dBm",
+      "per_second_window_s": 2,
+      "per_second_bucket_ms": 100,
+      "facts": [
+        { "name": "wfbcli.rx.ant_stats.rssi_avg_best" }
+      ]
+    },
+    {
+      "name": "DVR status",
+      "type": "DvrStatusWidget",
+      "x": -640,
+      "y": 200,
+      "icon_path": "sdcard-white.png",
+      "text": "Recording",
+      "facts": [
+        { "name": "dvr.recording" }
+      ]
+    },
+    {
+      "name": "msposd",
+      "type": "ExternalSurfaceWidget",
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0,
+      "facts": []
+    }
+  ]
+}
