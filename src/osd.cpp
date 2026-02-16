@@ -45,6 +45,7 @@ u_int custom_msg_refresh_count = 0;
 extern pthread_mutex_t video_mutex;
 extern pthread_cond_t video_cond;
 bool osd_update_ready = false;
+extern std::atomic<bool> drone_connected;
 
 
 double getTimeInterval(struct timespec* timestamp, struct timespec* last_meansure_timestamp) {
@@ -1423,6 +1424,40 @@ private:
 	std::vector<std::tuple<FactMatcher, Widget *, uint>> matchers;
 };
 
+void show_screensaver(cairo_t* cr, int width, int height) {
+    // int width_x = buf->width;
+    // int height_y = buf->height;
+
+    // draw background
+    cairo_set_source_rgba(cr, 0.0, 100.0, 0.0, 1.0);
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    // draw image at center
+    cairo_save(cr);
+
+    std::filesystem::path full_path = "/usr/local/share/pixelpilot/drone.png";
+    cairo_surface_t *icon = cairo_image_surface_create_from_png(full_path.c_str());
+
+    // get icon position at center
+    int icon_pos_x = (width / 2) - (cairo_image_surface_get_width(icon) / 2);
+    int icon_pos_y = (height / 2) - (cairo_image_surface_get_height(icon) / 2);
+    spdlog::error("icon_pos_x {} icon_pos_y {}", icon_pos_x, icon_pos_y);
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0); // black color
+    for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            if (dx * dx + dy * dy > 1 * 1) {
+                continue;
+            }
+            cairo_mask_surface(cr, icon, icon_pos_x + dx , icon_pos_y + dy);
+        }
+    }
+
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0); // white color
+    cairo_mask_surface(cr, icon, icon_pos_x, icon_pos_y);
+
+    cairo_restore(cr);
+}
 
 std::queue<Fact> fact_queue;
 std::mutex mtx;
@@ -1480,6 +1515,10 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 	cairo_select_font_face (cr, "Roboto", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
 	cairo_set_font_size (cr, 20);
 
+    if (!drone_connected.load())
+    {
+        show_screensaver(cr, buf->width, buf->height);
+    }
 	osd->draw(cr);
 
 	cairo_fill(cr);
