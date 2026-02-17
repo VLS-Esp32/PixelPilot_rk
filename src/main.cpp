@@ -389,19 +389,17 @@ void *__DISPLAY_THREAD__(void *param)
 			assert(ret>0);
 		}
 
-		if(enable_osd) {
-			ret = pthread_mutex_lock(&osd_mutex);
-			assert(!ret);
-			ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
-			assert(ret>0);
-		}
-		drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
+        ret = pthread_mutex_lock(&osd_mutex);
+        assert(!ret);
+        ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
+        assert(ret>0);
 
-        if (enable_osd) {
-            ret = pthread_mutex_unlock(&osd_mutex);
-            assert(!ret);
-        }
-        if (fb_id != 0) {
+        drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
+
+        ret = pthread_mutex_unlock(&osd_mutex);
+        assert(!ret);
+
+        if (enable_osd && fb_id != 0) {
             osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
             uint64_t decode_and_handover_display_ms = get_time_ms() - decoding_pts;
             osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
@@ -807,7 +805,7 @@ int main(int argc, char **argv)
 {
 	int ret;	
 	int i, j;
-	int mavlink_thread = 0;
+	bool mavlink_thread = false;
 	int print_modelist = 0;
 	char* dvr_template = NULL;
 	int video_framerate = -1;
@@ -931,8 +929,8 @@ int main(int argc, char **argv)
         	break;
 
     	case OPT_OSD: // --osd
-        	enable_osd = 1;
-        	mavlink_thread = 1;
+            enable_osd = true;
+            mavlink_thread = true;
         	break;
 
     	case OPT_OSD_CONFIG: // --osd-config
@@ -1029,10 +1027,6 @@ int main(int argc, char **argv)
 	printVersion();
 	spdlog::info("disable_vsync: {}", disable_vsync);
 
-	if (enable_osd == 0 ) {
-		video_zpos = 4;
-	}
-
     ////////////////////////////////////////////// DRM SETUP
 
 	int drm_ret = setup_drm(print_modelist, mode_width, mode_height, mode_vrefresh, target_frame_rate);
@@ -1081,32 +1075,29 @@ int main(int argc, char **argv)
 	assert(!ret);
 	ret = pthread_create(&tid_display, NULL, __DISPLAY_THREAD__, NULL);
 	assert(!ret);
-	if (enable_osd) {
-		nlohmann::json osd_config;
-		if(osd_config_path != "") {
-			std::ifstream f(osd_config_path);
-			osd_config = nlohmann::json::parse(f);
-		} else {
-			osd_config = {};
-		}
-		if (mavlink_thread) {
-			ret = pthread_create(&tid_mavlink, NULL, __MAVLINK_THREAD__, &signal_flag);
-			assert(!ret);
-		}
-		if (wfb_port) {
-			wfb_thread_params *wfb_args = (wfb_thread_params *)malloc(sizeof *wfb_args);
-			wfb_args->port = wfb_port;
-			ret = pthread_create(&tid_wfbcli, NULL, __WFB_CLI_THREAD__, wfb_args);
-			assert(!ret);
-		}
 
-		osd_thread_params *args = (osd_thread_params *)malloc(sizeof *args);
-        args->fd = drm_fd;
-        args->out = output_list;
-		args->config = osd_config;
-		ret = pthread_create(&tid_osd, NULL, __OSD_THREAD__, args);
-		assert(!ret);
-	}
+    nlohmann::json osd_config{};
+    if(osd_config_path != "") {
+        std::ifstream f(osd_config_path);
+        osd_config = nlohmann::json::parse(f);
+    }
+    if (mavlink_thread) {
+        ret = pthread_create(&tid_mavlink, NULL, __MAVLINK_THREAD__, &signal_flag);
+        assert(!ret);
+    }
+    if (wfb_port) {
+        wfb_thread_params *wfb_args = (wfb_thread_params *)malloc(sizeof *wfb_args);
+        wfb_args->port = wfb_port;
+        ret = pthread_create(&tid_wfbcli, NULL, __WFB_CLI_THREAD__, wfb_args);
+        assert(!ret);
+    }
+
+    osd_thread_params *args = (osd_thread_params *)malloc(sizeof *args);
+    args->fd = drm_fd;
+    args->out = output_list;
+    args->config = osd_config;
+    ret = pthread_create(&tid_osd, NULL, __OSD_THREAD__, args);
+    assert(!ret);
 
 	////////////////////////////////////////////// MAIN LOOP
 
@@ -1136,13 +1127,13 @@ int main(int argc, char **argv)
 		ret = pthread_join(tid_mavlink, NULL);
 		assert(!ret);
 	}
-	if (enable_osd) {
-		ret = pthread_join(tid_wfbcli, NULL);
-		assert(!ret);
-		ret = pthread_join(tid_osd, NULL);
-		assert(!ret);
-	}
-	if (dvr_template != NULL ){
+
+    ret = pthread_join(tid_wfbcli, NULL);
+    assert(!ret);
+    ret = pthread_join(tid_osd, NULL);
+    assert(!ret);
+
+    if (dvr_template != NULL ){
 		ret = pthread_join(tid_dvr, NULL);
 		assert(!ret);
 	}

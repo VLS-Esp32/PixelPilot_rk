@@ -162,8 +162,8 @@ void RtpReceiver::rtp_receiver_thread()
             auto current_time = std::chrono::steady_clock::now();
 
             if (std::chrono::duration_cast<std::chrono::seconds>(current_time - prev_time).count() > 15) {
-                spdlog::error("[ RTP ] No packets received durring 15 sec");
-                if (!drone_connected.load())
+                spdlog::error("[ RTP ] No packets received during 15 sec");
+                if (drone_connected.load())
                 {
                     drone_connected.store(false);
                 }

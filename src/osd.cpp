@@ -32,7 +32,7 @@ extern "C" {
 
 using json = nlohmann::json;
 
-int enable_osd = 0;
+bool enable_osd = false;
 int osd_zpos = 2;
 extern uint32_t refresh_frequency_ms;
 extern uint32_t frames_received;
@@ -1223,7 +1223,6 @@ public:
 			spdlog::error("OSD config doesn't have 'widgets' key");
 			return;
 		}
-		std::filesystem::path assets_dir(".");
 		if (cfg.contains("assets_dir")) {
 			assets_dir = cfg.at("assets_dir").template get<std::filesystem::path>();
 		}
@@ -1383,6 +1382,10 @@ public:
 		}
 	};
 
+    std::filesystem::path getAssetsDir() const {
+        return assets_dir;
+    }
+
 private:
 
 	cairo_surface_t *openIcon(std::string widget_name, std::filesystem::path base_path,
@@ -1422,28 +1425,28 @@ private:
 
 	std::vector<Widget *> widgets;
 	std::vector<std::tuple<FactMatcher, Widget *, uint>> matchers;
+    std::filesystem::path assets_dir{"."};
 };
 
-void show_screensaver(cairo_t* cr, int width, int height) {
-    // int width_x = buf->width;
-    // int height_y = buf->height;
+void show_screensaver(cairo_t* cr, int width, int height, std::filesystem::path icon_dir) {
 
     // draw background
-    cairo_set_source_rgba(cr, 0.0, 100.0, 0.0, 1.0);
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0); // black color
     cairo_rectangle(cr, 0, 0, width, height);
     cairo_fill(cr);
 
     // draw image at center
     cairo_save(cr);
 
-    std::filesystem::path full_path = "/usr/local/share/pixelpilot/drone.png";
+    std::string icon_name{"logo.png"}; 
+    std::filesystem::path full_path = icon_dir / icon_name;
     cairo_surface_t *icon = cairo_image_surface_create_from_png(full_path.c_str());
 
     // get icon position at center
     int icon_pos_x = (width / 2) - (cairo_image_surface_get_width(icon) / 2);
     int icon_pos_y = (height / 2) - (cairo_image_surface_get_height(icon) / 2);
-    spdlog::error("icon_pos_x {} icon_pos_y {}", icon_pos_x, icon_pos_y);
     cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0); // black color
+    
     for (int dx = -1; dx <= 1; ++dx) {
         for (int dy = -1; dy <= 1; ++dy) {
             if (dx * dx + dy * dy > 1 * 1) {
@@ -1473,7 +1476,7 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 
 	//check custom message
 	//TODO: move this code to the main thread's main loop (read_gstreamerpipe_stream, sleep(10))
-	if (osd_custom_message) {
+	if (enable_osd && osd_custom_message) {
 		std::string filename = "/run/pixelpilot.msg";
 		FILE *file = fopen(filename.c_str(), "r");
 		osd_tag tag;
@@ -1512,14 +1515,16 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 	cairo_paint(cr);
 	cairo_restore(cr);
 
-	cairo_select_font_face (cr, "Roboto", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-	cairo_set_font_size (cr, 20);
+	cairo_select_font_face(cr, "Roboto", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+	cairo_set_font_size(cr, 20);
 
     if (!drone_connected.load())
     {
-        show_screensaver(cr, buf->width, buf->height);
+        show_screensaver(cr, buf->width, buf->height, osd->getAssetsDir());
     }
-	osd->draw(cr);
+    if (enable_osd) {
+        osd->draw(cr);
+    }
 
 	cairo_fill(cr);
 	cairo_destroy(cr);
@@ -1564,12 +1569,18 @@ void *__OSD_THREAD__(void *param) {
 		std::vector<Fact> fact_buf;
 		auto since_last_display = std::chrono::steady_clock::now() - last_display_at;
 		auto wait = std::chrono::milliseconds(refresh_frequency_ms) - since_last_display;
-		bool got_fact = cv.wait_for(
+		bool got_fact{false};
+
+        if (enable_osd) {
+            got_fact = cv.wait_for(
 					lock,
 					wait,
 					[/*fact_queue*/] {
 						return !fact_queue.empty();
 					});
+        } else {
+            sleep(1);
+        }
 		if (got_fact) {
 			// thread woke up because we got a new fact(s)
 			// copy all the facts to the temporary buffer to unlock the queue ASAP
