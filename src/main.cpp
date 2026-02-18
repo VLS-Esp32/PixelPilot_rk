@@ -97,6 +97,7 @@ enum AppOption {
     OPT_DISABLE_VSYNC,
     OPT_SCREEN_MODE_LIST,
     OPT_WFB_API_PORT,
+    OPT_SCREENSAVER_IMG,
     OPT_VERSION
 };
 
@@ -123,6 +124,7 @@ static const struct option pixelpilot_long_options[] = {
     {"disable-vsync",       no_argument,       0, OPT_DISABLE_VSYNC},
     {"screen-mode-list",    no_argument,       0, OPT_SCREEN_MODE_LIST},
     {"wfb-api-port",        required_argument, 0, OPT_WFB_API_PORT},
+    {"screensaver-image",   required_argument, 0, OPT_SCREENSAVER_IMG},
     {"version",             no_argument,       0, OPT_VERSION},
     {"help",                no_argument,       0, 'h'},
     {0, 0, 0, 0}
@@ -136,9 +138,10 @@ int drm_fd = 0;
 pthread_mutex_t video_mutex;
 pthread_cond_t video_cond;
 extern bool osd_update_ready;
-extern std::atomic<bool> drone_connected;
+std::atomic<bool> drone_connected = false;
 int video_zpos = 1;
 
+bool update_osd_video_size = false;
 bool mavlink_dvr_on_arm = false;
 bool osd_custom_message = false;
 bool disable_vsync = false;
@@ -403,6 +406,11 @@ void *__DISPLAY_THREAD__(void *param)
             osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
             uint64_t decode_and_handover_display_ms = get_time_ms() - decoding_pts;
             osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
+            if (update_osd_video_size) {
+                osd_publish_uint_fact("video.width", NULL, 0, output_list->video_frm_width);
+                osd_publish_uint_fact("video.height", NULL, 0, output_list->video_frm_height);
+                update_osd_video_size = false;
+            }
         }
 	}
 end:	
@@ -711,14 +719,7 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
 		}
         else {
             if (!drone_connected.load()) {
-                void *batch = osd_batch_init(4);
-
-                osd_add_clear_fact(batch, "video.displayed_frame", nullptr, 0);
-                osd_add_clear_fact(batch, "rtp.received_bytes", nullptr, 0);
-                osd_add_clear_fact(batch, "video.width", nullptr, 0);
-                osd_add_clear_fact(batch, "video.height", nullptr, 0);
-
-                osd_publish_batch(batch);
+                update_osd_video_size = true;
             }
             sleep(10);
 		}
@@ -789,6 +790,8 @@ void printHelp() {
     "    --wfb-api-port            - Port of wfb-server for cli statistics. (Default: 8003)\n"
 	"                                Use \"0\" to disable this stats\n"
     "\n"
+    "    --screensaver-image       - Path to image that will shown on screensaver.\n"
+    "\n"
     "    --version                 - Show program version\n"
     "\n", APP_VERSION_MAJOR, APP_VERSION_MINOR
   );
@@ -819,6 +822,7 @@ int main(int argc, char **argv)
 	uint32_t mode_vrefresh = 0;
 	uint32_t target_frame_rate = 0;
 	std::string osd_config_path;
+    std::string screensaver_image_path;
 	auto log_level = spdlog::level::info;
 	
     std::string pidFilePath = "/run/pixelpilot.pid";
@@ -1006,7 +1010,18 @@ int main(int argc, char **argv)
         	break;
     	}
 
-    	case OPT_VERSION: // --version
+        case OPT_SCREENSAVER_IMG: { // --screensaver-image
+            std::string image_path = std::string(optarg);
+            if (!std::filesystem::exists(image_path)){
+                spdlog::error("--screensaver-image: invalid path to image '{}'", optarg);
+                printHelp();
+                return -1;
+            }
+            screensaver_image_path = image_path;
+            break;
+        }
+
+        case OPT_VERSION: // --version
         	printVersion();
         	return 0;
 
@@ -1077,25 +1092,27 @@ int main(int argc, char **argv)
 	assert(!ret);
 
     nlohmann::json osd_config{};
-    if(osd_config_path != "") {
-        std::ifstream f(osd_config_path);
-        osd_config = nlohmann::json::parse(f);
+    if (enable_osd) {
+        if(osd_config_path != "") {
+            std::ifstream f(osd_config_path);
+            osd_config = nlohmann::json::parse(f);
+        }
+        if (mavlink_thread) {
+            ret = pthread_create(&tid_mavlink, NULL, __MAVLINK_THREAD__, &signal_flag);
+            assert(!ret);
+        }
+        if (wfb_port) {
+            wfb_thread_params *wfb_args = (wfb_thread_params *)malloc(sizeof *wfb_args);
+            wfb_args->port = wfb_port;
+            ret = pthread_create(&tid_wfbcli, NULL, __WFB_CLI_THREAD__, wfb_args);
+            assert(!ret);
+        }
     }
-    if (mavlink_thread) {
-        ret = pthread_create(&tid_mavlink, NULL, __MAVLINK_THREAD__, &signal_flag);
-        assert(!ret);
-    }
-    if (wfb_port) {
-        wfb_thread_params *wfb_args = (wfb_thread_params *)malloc(sizeof *wfb_args);
-        wfb_args->port = wfb_port;
-        ret = pthread_create(&tid_wfbcli, NULL, __WFB_CLI_THREAD__, wfb_args);
-        assert(!ret);
-    }
-
-    osd_thread_params *args = (osd_thread_params *)malloc(sizeof *args);
+    osd_thread_params *args = new osd_thread_params;
     args->fd = drm_fd;
     args->out = output_list;
     args->config = osd_config;
+    args->screensaver_image = screensaver_image_path;
     ret = pthread_create(&tid_osd, NULL, __OSD_THREAD__, args);
     assert(!ret);
 
@@ -1123,17 +1140,19 @@ int main(int argc, char **argv)
 	ret = pthread_mutex_destroy(&video_mutex);
 	assert(!ret);
 
-	if (mavlink_thread) {
-		ret = pthread_join(tid_mavlink, NULL);
-		assert(!ret);
-	}
+    if (enable_osd) {
+        if (mavlink_thread) {
+            ret = pthread_join(tid_mavlink, NULL);
+            assert(!ret);
+        }
+        ret = pthread_join(tid_wfbcli, NULL);
+        assert(!ret);
+    }
 
-    ret = pthread_join(tid_wfbcli, NULL);
-    assert(!ret);
     ret = pthread_join(tid_osd, NULL);
     assert(!ret);
 
-    if (dvr_template != NULL ){
+    if (dvr_template != NULL ) {
 		ret = pthread_join(tid_dvr, NULL);
 		assert(!ret);
 	}

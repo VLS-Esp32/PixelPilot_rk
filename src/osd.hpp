@@ -6,6 +6,7 @@ extern "C" {
 }
 #include <nlohmann/json.hpp>
 #include <filesystem>
+#include <string>
 
 namespace nlohmann {
     template <>
@@ -24,6 +25,7 @@ typedef struct {
 	struct modeset_output *out;
 	int fd;
 	nlohmann::json config;
+    std::string screensaver_image;
 } osd_thread_params;
 
 extern int osd_thread_signal;

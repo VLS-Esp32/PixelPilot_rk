@@ -9,4 +9,5 @@ typedef struct {
 
 void *__WFB_CLI_THREAD__(void *param);
 
+void clear_osd_wfbcli();
 #endif

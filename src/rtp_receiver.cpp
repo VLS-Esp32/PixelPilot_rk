@@ -30,6 +30,12 @@
 #include "rtp-demuxer.h"
 #include "rtp-profile.h"
 
+#include "wfbcli.hpp"
+
+extern "C" {
+#include "osd.h"
+}
+
 extern std::atomic<bool> drone_connected;
 
 // Main callback for packet processing after codec is known
@@ -153,19 +159,29 @@ void RtpReceiver::rtp_receiver_thread()
 
     uint8_t buffer[1600];
     struct pollfd fds[] = { { .fd = m_socket, .events = POLLIN } };
+    auto current_time = std::chrono::steady_clock::now();
+    auto prev_time = current_time;
     // packet reception loop
     while (this->m_running->load()) {
         int ret = poll(fds, 1, 1000);
         if (ret < 0) { if (errno == EINTR) continue; perror("poll"); break; }
         if (ret == 0) {
-            static auto prev_time = std::chrono::steady_clock::now();
-            auto current_time = std::chrono::steady_clock::now();
+            current_time = std::chrono::steady_clock::now();
 
             if (std::chrono::duration_cast<std::chrono::seconds>(current_time - prev_time).count() > 15) {
-                spdlog::error("[ RTP ] No packets received during 15 sec");
+                spdlog::info("[ RTP ] No packets received during 15 sec");
                 if (drone_connected.load())
                 {
                     drone_connected.store(false);
+                    void *batch = osd_batch_init(4);
+
+                    osd_add_clear_fact(batch, "video.displayed_frame", nullptr, 0);
+                    osd_add_clear_fact(batch, "rtp.received_bytes", nullptr, 0);
+                    osd_add_clear_fact(batch, "video.width", nullptr, 0);
+                    osd_add_clear_fact(batch, "video.height", nullptr, 0);
+
+                    osd_publish_batch(batch);
+                    clear_osd_wfbcli();
                 }
                 prev_time = current_time;
             }
@@ -180,6 +196,7 @@ void RtpReceiver::rtp_receiver_thread()
                 {
                     drone_connected.store(true);
                 }
+                prev_time = std::chrono::steady_clock::now();
             }
         }
     }

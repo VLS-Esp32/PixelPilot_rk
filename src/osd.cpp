@@ -1212,6 +1212,12 @@ private:
 
 class Osd {
 public:
+    ~Osd() {
+        if (screensaver_image) {
+            cairo_surface_destroy(screensaver_image);
+        }
+    }
+
 	void loadConfig(json cfg) {
 		json obj;
 		if (!cfg.contains("format")) {
@@ -1223,6 +1229,7 @@ public:
 			spdlog::error("OSD config doesn't have 'widgets' key");
 			return;
 		}
+        std::filesystem::path assets_dir{"."};
 		if (cfg.contains("assets_dir")) {
 			assets_dir = cfg.at("assets_dir").template get<std::filesystem::path>();
 		}
@@ -1382,8 +1389,18 @@ public:
 		}
 	};
 
-    std::filesystem::path getAssetsDir() const {
-        return assets_dir;
+    void loadScreensaverImage(std::string image_path)  {
+
+        cairo_surface_t *image = cairo_image_surface_create_from_png(image_path.c_str());
+        if (cairo_surface_status(image) != CAIRO_STATUS_SUCCESS) {
+            spdlog::error("Can't open icon '{}' for screensaver", image_path);
+            return;
+        }
+        screensaver_image = image;
+    }
+
+    cairo_surface_t * getScreensaverImage() const {
+        return screensaver_image;
     }
 
 private:
@@ -1425,41 +1442,28 @@ private:
 
 	std::vector<Widget *> widgets;
 	std::vector<std::tuple<FactMatcher, Widget *, uint>> matchers;
-    std::filesystem::path assets_dir{"."};
+    cairo_surface_t * screensaver_image;
 };
 
-void show_screensaver(cairo_t* cr, int width, int height, std::filesystem::path icon_dir) {
-
+void show_screensaver(cairo_t* cr, int width, int height, cairo_surface_t * screensaver_image) {
     // draw background
     cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0); // black color
     cairo_rectangle(cr, 0, 0, width, height);
     cairo_fill(cr);
 
-    // draw image at center
-    cairo_save(cr);
+    if (screensaver_image) {
+        int image_width = cairo_image_surface_get_width(screensaver_image);
+        int image_height = cairo_image_surface_get_height(screensaver_image);
 
-    std::string icon_name{"logo.png"}; 
-    std::filesystem::path full_path = icon_dir / icon_name;
-    cairo_surface_t *icon = cairo_image_surface_create_from_png(full_path.c_str());
-
-    // get icon position at center
-    int icon_pos_x = (width / 2) - (cairo_image_surface_get_width(icon) / 2);
-    int icon_pos_y = (height / 2) - (cairo_image_surface_get_height(icon) / 2);
-    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0); // black color
-    
-    for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-            if (dx * dx + dy * dy > 1 * 1) {
-                continue;
-            }
-            cairo_mask_surface(cr, icon, icon_pos_x + dx , icon_pos_y + dy);
+        if (image_width > width || image_height > height) {
+            spdlog::error("Icon larger than screen {} x {}, icon {} x {}",
+                          image_width, image_height, width, height);
+            return;
         }
+        // draw image at center of the screen
+        cairo_set_source_surface(cr, screensaver_image, (width - image_width) / 2, (height - image_height) / 2);
+        cairo_paint(cr);
     }
-
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0); // white color
-    cairo_mask_surface(cr, icon, icon_pos_x, icon_pos_y);
-
-    cairo_restore(cr);
 }
 
 std::queue<Fact> fact_queue;
@@ -1520,7 +1524,7 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 
     if (!drone_connected.load())
     {
-        show_screensaver(cr, buf->width, buf->height, osd->getAssetsDir());
+        show_screensaver(cr, buf->width, buf->height, osd->getScreensaverImage());
     }
     if (enable_osd) {
         osd->draw(cr);
@@ -1554,7 +1558,10 @@ void *__OSD_THREAD__(void *param) {
 	Osd *osd = new Osd;
 	pthread_setname_np(pthread_self(), "__OSD");
 
-	osd->loadConfig(p->config);
+    osd->loadScreensaverImage(p->screensaver_image);
+    if (!p->config.empty()) {
+	    osd->loadConfig(p->config);
+    }
 	auto last_display_at = std::chrono::steady_clock::now();
 
 	int ret = pthread_mutex_init(&osd_mutex, NULL);

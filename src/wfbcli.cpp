@@ -31,7 +31,6 @@ extern "C" {
 #define BUFFER_SIZE 10 * 1024
 
 int wfb_thread_signal = 0;
-std::atomic<bool> drone_connected = false;
 bool cli_connected = false;
 
 std::unordered_set<uint64_t> seen_rx_ant_ids;
@@ -184,6 +183,25 @@ void clear_wfbcli_cli_header_facts()
     osd_publish_batch(batch);
 }
 
+void clear_osd_wfbcli()
+{
+    for (const auto &id : seen_rx_ids) {
+        clear_wfbcli_rx_link_facts(id.c_str());
+    }
+
+    seen_rx_ant_ids.clear();
+    seen_rx_ids.clear();
+
+    for (const auto &id : seen_tx_ids) {
+        clear_wfbcli_tx_link_facts(id.c_str());
+    }
+
+    seen_tx_ant_ids.clear();
+    seen_tx_ids.clear();
+
+    clear_wfbcli_cli_header_facts();
+}
+
 int process_rx(const msgpack::object& packet) {
 
     void *batch = osd_batch_init(16);
@@ -291,27 +309,12 @@ int process_rx(const msgpack::object& packet) {
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_best", tags, 1, best_rssi_avg);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_best", tags, 1, best_snr_avg);
         osd_add_bool_fact(batch, "wfbcli.drone.connected", tags, 1, true);
-        drone_connected.store(true);
         prev_time = current_time;
     }
 
     // check difference between packets more then 3 sec if true set drone connection lost
-    if (std::chrono::duration_cast<std::chrono::seconds>(current_time - prev_time).count() > 3 && drone_connected.load()) {
+    if (std::chrono::duration_cast<std::chrono::seconds>(current_time - prev_time).count() > 3) {
         osd_add_bool_fact(batch, "wfbcli.drone.connected", tags, 1, false);
-        for (const auto &id : seen_rx_ids) {
-            clear_wfbcli_rx_link_facts(id.c_str());
-        }
-        seen_rx_ant_ids.clear();
-        seen_rx_ids.clear();
-        for (const auto &id : seen_tx_ids) {
-            clear_wfbcli_tx_link_facts(id.c_str());
-        }
-        seen_tx_ant_ids.clear();
-        seen_tx_ids.clear();
-
-        clear_wfbcli_cli_header_facts();
-
-        drone_connected.store(false);
     }
 
     osd_publish_batch(batch);
@@ -526,20 +529,8 @@ int reconnect_to_server(int port) {
 		}
 
         if (cli_connected){
-            for (const auto &id : seen_rx_ids) {
-                clear_wfbcli_rx_link_facts(id.c_str());
-            }
-            seen_rx_ant_ids.clear();
-            seen_rx_ids.clear();
-            for (const auto &id : seen_tx_ids) {
-                clear_wfbcli_tx_link_facts(id.c_str());
-            }
-            seen_tx_ant_ids.clear();
-            seen_tx_ids.clear();
-
-            clear_wfbcli_cli_header_facts();
+            clear_osd_wfbcli();
             cli_connected = false;
-            drone_connected.store(false);
         }
 
 		SPDLOG_WARN("Reconnection failed. Retrying in 1 second");
