@@ -510,7 +510,11 @@ public:
 	IconWidget(int pos_x, int pos_y, cairo_surface_t *icon):
 		Widget(pos_x, pos_y), icon(icon) {};
 
-	virtual void draw(cairo_t *cr) {
+    virtual ~IconWidget() {
+        cairo_surface_destroy(icon);
+    }
+
+    virtual void draw(cairo_t *cr) {
 		auto [x, y] = xy(cr);
 		drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
 	}
@@ -524,6 +528,10 @@ class IconTextWidget: public Widget {
 public:
 	IconTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string text):
 		Widget(pos_x, pos_y), text(text), icon(icon) {};
+
+    virtual ~IconTextWidget() {
+        cairo_surface_destroy(icon);
+    }
 
 	virtual void draw(cairo_t *cr) {
 		auto [x, y] = xy(cr);
@@ -623,6 +631,10 @@ class IconTplTextWidget: public TplTextWidget {
 public:
 	IconTplTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args):
 		TplTextWidget(pos_x, pos_y, tpl, num_args), icon(icon) {};
+
+    virtual ~IconTplTextWidget() {
+        cairo_surface_destroy(icon);
+    }
 
 	virtual void draw(cairo_t *cr) {
 		auto [x, y] = xy(cr);
@@ -1062,15 +1074,18 @@ class ExternalSurfaceWidget: public Widget {
 public:
 	ExternalSurfaceWidget(int pos_x, int pos_y, std::string shm_name ): Widget(pos_x, pos_y), shm_name(shm_name)  {};
 
-	virtual void init_shm(cairo_t *cr) {
+	void init_shm(cairo_t *cr) {
 		SPDLOG_INFO("Creating shm region {}", shm_name);
 
 		cairo_surface_t *target = cairo_get_target(cr);
 		int width = cairo_image_surface_get_width(target);
 		int height = cairo_image_surface_get_height(target);
 
+        const uint32_t stride   = static_cast<uint32_t>(width * 4); // ARGB32
+		const size_t   buf_size = static_cast<size_t>(stride) * height;
+
 		// Calculate total shared memory size
-		shm_size = sizeof(SharedMemoryRegion) + (width * height * 4); // Metadata + Image data
+		shm_size = sizeof(SharedMemoryRegion) + (buf_size * NUMBER_BUFFERS); // Metadata + 3 buffers for Image data
 
 		// Create shared memory region
 		int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
@@ -1082,47 +1097,84 @@ public:
 		if (ftruncate(shm_fd, shm_size) == -1) {
 			perror("Failed to set shared memory size");
 			shm_unlink(shm_name.c_str());
+            close(shm_fd);
 			return;
 		}
 
 		// Map shared memory to process address space
-		auto *shm_region = static_cast<SharedMemoryRegion*>(
+		shm_region = static_cast<SharedMemoryRegion*>(
 			mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0)
 		);
 		if (shm_region == MAP_FAILED) {
 			perror("Failed to map shared memory");
 			shm_unlink(shm_name.c_str());
+            close(shm_fd);
 			return;
 		}
+
+        close(shm_fd);
 
 		// Write metadata
 		shm_region->width = width;
 		shm_region->height = height;
+        shm_region->stride = stride;
+        shm_region->refresh_rate = refresh_frequency_ms;
+        shm_region->ready_index.store(-1);
+        shm_region->front_index.store(0);
+        shm_region->back_index.store(1);
 
-		// Create Cairo surface for the image data
-		shm_surface = cairo_image_surface_create_for_data(
-			shm_region->data, CAIRO_FORMAT_ARGB32, width, height, width * 4
-		);
+        unsigned char *base = shm_region->data;
 
+        for (int i = 0; i < NUMBER_BUFFERS; ++i) {
+            unsigned char *buf_ptr = base + (i * buf_size);
+
+            // Create Cairo surface for the image data
+            cairo_surface_t *surf = cairo_image_surface_create_for_data(
+                buf_ptr, CAIRO_FORMAT_ARGB32, width, height, stride);
+
+            if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+                spdlog::error("Failed to create cairo surface for buffer {}", i);
+                cairo_surface_destroy(surf);
+                shm_surfaces[i] = nullptr;
+            } else {
+                shm_surfaces[i] = surf;
+            }
+
+        }
 		// Store pointer for cleanup
 		shm_data = reinterpret_cast<unsigned char*>(shm_region);
 	}
 
-
 	virtual void draw(cairo_t *cr) {
+        if (!shm_region) {
+            init_shm(cr);
+        }
+        if (!shm_region) {
+            return;
+        }
 
-		if (! shm_surface) 
-			init_shm(cr);
-		auto [x, y] = xy(cr);
-		cairo_set_source_surface(cr, shm_surface, x, y); // Position at (0, 0)
-    	cairo_paint(cr); // Paint shm_surface onto base_surface
-	}
+        // skip drawing if we have no shared memory or no ready buffer to draw
+        if (shm_region->ready_index.load() < 0) {
+            return;
+        }
 
-	~ExternalSurfaceWidget() {
+        shm_region->front_index.store(shm_region->ready_index.load());
+        shm_region->ready_index.store(-1);
+
+        auto [x, y] = xy(cr);
+        cairo_set_source_surface(cr, shm_surfaces[shm_region->front_index.load()], x, y); // Position at (0, 0)
+        cairo_paint(cr); // Paint shm_surface onto base_surface
+    }
+
+    virtual ~ExternalSurfaceWidget() {
 		SPDLOG_INFO("Destroying shm region {}", shm_name);
-		if (shm_surface) {
-			cairo_surface_destroy(shm_surface);
-		}
+
+        for (int i = 0; i < NUMBER_BUFFERS; ++i) {
+            if (shm_surfaces[i]) {
+                cairo_surface_destroy(shm_surfaces[i]);
+                shm_surfaces[i] = nullptr;
+            }
+        }
 		if (shm_data) {
 			munmap(shm_data, shm_size);
 		}
@@ -1130,9 +1182,10 @@ public:
 	}
 
 protected:
-	cairo_surface_t *shm_surface = nullptr;
-	unsigned char *shm_data = nullptr;
-	size_t shm_size;
+	SharedMemoryRegion *shm_region = nullptr;
+	cairo_surface_t *shm_surfaces[NUMBER_BUFFERS] = {nullptr, nullptr, nullptr};
+	size_t shm_size = 0;
+    unsigned char *shm_data = nullptr;
 	std::string shm_name;
 };
 
