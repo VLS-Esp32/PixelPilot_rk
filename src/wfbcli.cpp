@@ -103,6 +103,7 @@ void clear_wfbcli_rx_link_facts(const char *id)
     osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.snr_avg_global",  tags, n_tags);
     osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_best",   tags, n_tags);
     osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.snr_avg_best",    tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.ant_count",                 tags, n_tags);
 
     strcpy(tags[1].key, "ant_id");
     n_tags = 2;
@@ -308,6 +309,7 @@ int process_rx(const msgpack::object& packet) {
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_global", tags, 1, avg_snr);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_best", tags, 1, best_rssi_avg);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_best", tags, 1, best_snr_avg);
+        osd_add_uint_fact(batch, "wfbcli.rx.ant_count", tags, 1, (uint64_t)ant_count);
         osd_add_bool_fact(batch, "wfbcli.drone.connected", tags, 1, true);
         prev_time = current_time;
     }

@@ -880,6 +880,27 @@ public:
 	}
 };
 
+class IconTplStatusWidget : public IconTplTextWidget {
+public:
+    IconTplStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args) :
+        IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args) {}
+
+    void draw(cairo_t *cr) {
+        auto [x, y] = xy(cr);
+
+        std::vector<Fact> subargs;
+        for (size_t i = 1; i < args.size(); ++i) subargs.push_back(args[i]);
+        std::unique_ptr<std::string> msg = render_tpl(tpl, subargs);
+
+        if(args[0].isDefined() && args[0].getBoolValue()) {
+            drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
+            drawStrokeText(cr, x + 35, y, *msg, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 2.0);
+        } else {
+            drawStrokeIcon(cr, icon, x, y - 20, CairoColor{0.4, 0.4, 0.44, 1.0}, CairoColor{0.0, 0.0, 0.0, 0.4}, 1);
+            drawStrokeText(cr, x + 35, y, *msg, CairoColor{0.4, 0.4, 0.44, 1.0}, CairoColor{0.0, 0.0, 0.0, 0.4}, 2.0);
+        }
+    }
+};
 
 class VideoWidget: public IconTplTextWidget {
 public:
@@ -1290,6 +1311,12 @@ public:
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new IconStatusWidget(x, y, icon), matchers);
+			} else if (type == "IconTplStatusWidget") {
+    			auto tpl = widget_j.at("template").template get<std::string>();
+    			auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
+    			cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
+    			if (icon == NULL) break;
+    			addWidget(new IconTplStatusWidget(x, y, icon, tpl, (uint)matchers.size()), matchers);
 			} else if(type == "VideoWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();

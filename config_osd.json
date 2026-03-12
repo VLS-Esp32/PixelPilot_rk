@@ -36,10 +36,8 @@
       "x": 500,
       "y": -24,
       "template": "SNR: %i dB",
-      "per_second_window_s": 2,
-      "per_second_bucket_ms": 100,
       "facts": [
-        { "name": "wfbcli.rx.ant_stats.snr_avg_best" }
+        { "name": "wfbcli.rx.ant_stats.snr_avg_best", "tags": {"id": "video rx"}}
       ]
     },
     {
@@ -48,32 +46,28 @@
       "x": 650,
       "y": -24,
       "template": "RSSI: %i dBm",
-      "per_second_window_s": 2,
-      "per_second_bucket_ms": 100,
       "facts": [
-        { "name": "wfbcli.rx.ant_stats.rssi_avg_best" }
+        { "name": "wfbcli.rx.ant_stats.rssi_avg_best", "tags": {"id": "video rx"}}
       ]
     },
     {
       "name": "WFB client status",
-      "type": "IconStatusWidget",
-      "x": -50,
+      "type": "IconTplStatusWidget",
+      "x": -75,
       "y": -24,
       "icon_path": "tower-cell.png",
-      "per_second_window_s": 2,
-      "per_second_bucket_ms": 100,
+      "template": "%i",
       "facts": [
-        { "name": "wfbcli.cli.connected" }
-      ]
+        { "name": "wfbcli.cli.connected" },
+        { "name": "wfbcli.rx.ant_count", "tags": {"id": "video rx"}}
+      ] 
     },
     {
       "name": "Drone connection status",
       "type": "IconStatusWidget",
-      "x": -100,
+      "x": -125,
       "y": -24,
       "icon_path": "drone.png",
-      "per_second_window_s": 2,
-      "per_second_bucket_ms": 100,
       "facts": [
         { "name": "wfbcli.drone.connected" }
       ]
