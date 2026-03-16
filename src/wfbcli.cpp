@@ -225,7 +225,8 @@ int process_rx(const msgpack::object& packet) {
             id = packet.via.map.ptr[i].val.as<std::string>();
             seen_rx_ids.insert(id);
             strcpy(tags[0].key, "id");
-            strcpy(tags[0].val, id.c_str());
+            strncpy(tags[0].val, id.c_str(), sizeof(tags[0].val) - 1);
+            tags[0].val[sizeof(tags[0].val) - 1] = '\0';
         } else if (key == "packets") {
             packets = packet.via.map.ptr[i].val;
         } else if (key == "rx_ant_stats") {
@@ -342,7 +343,8 @@ int process_tx(const msgpack::object& packet) {
             id = packet.via.map.ptr[i].val.as<std::string>();
             seen_tx_ids.insert(id);
             strcpy(tags[0].key, "id");
-            strcpy(tags[0].val, id.c_str());
+            strncpy(tags[0].val, id.c_str(), sizeof(tags[0].val) - 1);
+            tags[0].val[sizeof(tags[0].val) - 1] = '\0';
         } else if (key == "packets") {
             packets = packet.via.map.ptr[i].val;
         } else if (key == "latency") {

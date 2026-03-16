@@ -45,7 +45,7 @@ u_int custom_msg_refresh_count = 0;
 extern pthread_mutex_t video_mutex;
 extern pthread_cond_t video_cond;
 bool osd_update_ready = false;
-extern std::atomic<bool> drone_connected;
+extern std::atomic<bool> video_present;
 
 
 double getTimeInterval(struct timespec* timestamp, struct timespec* last_meansure_timestamp) {
@@ -575,6 +575,10 @@ protected:
 				at_placeholder = false;
 			} else if (at_placeholder) {
 				at_placeholder = false;
+				if (fact_i >= args.size()) {
+                	msg->push_back('-');
+                	continue;
+            	}
 				fact = &args[fact_i];
 				if (!fact->isDefined()) {
 					msg->push_back('-');
@@ -1085,7 +1089,7 @@ public:
 		const size_t   buf_size = static_cast<size_t>(stride) * height;
 
 		// Calculate total shared memory size
-		shm_size = sizeof(SharedMemoryRegion) + (buf_size * NUMBER_BUFFERS); // Metadata + 3 buffers for Image data
+		shm_size = sizeof(SharedMemoryRegion) + (buf_size * SHM_BUFFERS_COUNT); // Metadata + 3 buffers for Image data
 
 		// Create shared memory region
 		int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
@@ -1125,7 +1129,7 @@ public:
 
         unsigned char *base = shm_region->data;
 
-        for (int i = 0; i < NUMBER_BUFFERS; ++i) {
+        for (int i = 0; i < SHM_BUFFERS_COUNT; ++i) {
             unsigned char *buf_ptr = base + (i * buf_size);
 
             // Create Cairo surface for the image data
@@ -1153,23 +1157,22 @@ public:
             return;
         }
 
-        // skip drawing if we have no shared memory or no ready buffer to draw
-        if (shm_region->ready_index.load() < 0) {
-            return;
+		int ready = shm_region->ready_index.exchange(-1);
+		if (ready >= 0 && ready < SHM_BUFFERS_COUNT) {
+			last_surface_index = ready;
+			shm_region->front_index.store(ready);
         }
-
-        shm_region->front_index.store(shm_region->ready_index.load());
-        shm_region->ready_index.store(-1);
-
-        auto [x, y] = xy(cr);
-        cairo_set_source_surface(cr, shm_surfaces[shm_region->front_index.load()], x, y); // Position at (0, 0)
-        cairo_paint(cr); // Paint shm_surface onto base_surface
+		if (last_surface_index != -1) {
+			auto [x, y] = xy(cr);
+        	cairo_set_source_surface(cr, shm_surfaces[last_surface_index], x, y); // Position at (0, 0)
+        	cairo_paint(cr); // Paint shm_surface onto base_surface
+		} 
     }
 
     virtual ~ExternalSurfaceWidget() {
 		SPDLOG_INFO("Destroying shm region {}", shm_name);
 
-        for (int i = 0; i < NUMBER_BUFFERS; ++i) {
+        for (int i = 0; i < SHM_BUFFERS_COUNT; ++i) {
             if (shm_surfaces[i]) {
                 cairo_surface_destroy(shm_surfaces[i]);
                 shm_surfaces[i] = nullptr;
@@ -1183,7 +1186,8 @@ public:
 
 protected:
 	SharedMemoryRegion *shm_region = nullptr;
-	cairo_surface_t *shm_surfaces[NUMBER_BUFFERS] = {nullptr, nullptr, nullptr};
+	int32_t last_surface_index = -1;
+	cairo_surface_t *shm_surfaces[SHM_BUFFERS_COUNT] = {nullptr, nullptr, nullptr};
 	size_t shm_size = 0;
     unsigned char *shm_data = nullptr;
 	std::string shm_name;
@@ -1309,8 +1313,8 @@ public:
 		}
 		json widgets_j = cfg.at("widgets");
 		for (json widget_j : widgets_j) {
-			if(!(widget_j.contains("name") || widget_j.contains("type") || widget_j.contains("x") ||
-				 widget_j.contains("y") || widget_j.contains("facts"))) {
+			if(!widget_j.contains("name") || !widget_j.contains("type") || !widget_j.contains("x") ||
+				!widget_j.contains("y") || !widget_j.contains("facts")) {
 				spdlog::error("Missing required key name/type/x/y/facts");
 				return;
 			}
@@ -1522,7 +1526,7 @@ private:
 
 	std::vector<Widget *> widgets;
 	std::vector<std::tuple<FactMatcher, Widget *, uint>> matchers;
-    cairo_surface_t * screensaver_image;
+    cairo_surface_t * screensaver_image = nullptr;
 };
 
 void show_screensaver(cairo_t* cr, int width, int height, cairo_surface_t * screensaver_image) {
@@ -1536,8 +1540,8 @@ void show_screensaver(cairo_t* cr, int width, int height, cairo_surface_t * scre
         int image_height = cairo_image_surface_get_height(screensaver_image);
 
         if (image_width > width || image_height > height) {
-            spdlog::error("Icon larger than screen {} x {}, icon {} x {}",
-                          image_width, image_height, width, height);
+			spdlog::error("Icon {} x {} larger than screen {} x {}",
+              			  image_width, image_height, width, height);
             return;
         }
         // draw image at center of the screen
@@ -1559,7 +1563,6 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 	memset(msg, 0x00, sizeof(msg));
 
 	//check custom message
-	//TODO: move this code to the main thread's main loop (read_gstreamerpipe_stream, sleep(10))
 	if (enable_osd && osd_custom_message) {
 		std::string filename = "/run/pixelpilot.msg";
 		FILE *file = fopen(filename.c_str(), "r");
@@ -1602,7 +1605,7 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 	cairo_select_font_face(cr, "Roboto", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
 	cairo_set_font_size(cr, 20);
 
-    if (!drone_connected.load())
+    if (!video_present.load())
     {
         show_screensaver(cr, buf->width, buf->height, osd->getScreensaverImage());
     }

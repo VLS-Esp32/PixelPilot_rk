@@ -31,7 +31,7 @@ typedef struct {
 
 extern int osd_thread_signal;
 
-#define NUMBER_BUFFERS 3
+#define SHM_BUFFERS_COUNT 3
 
 struct SharedMemoryRegion {
     uint16_t width;       // Image width

@@ -59,6 +59,8 @@ extern "C" {
 
 #define CODEC_ALIGN(x, a)   (((x)+(a)-1)&~((a)-1))
 
+#define NO_VIDEO_TIMEOUT_MS 15000
+
 struct {
 	MppCtx		  ctx;
 	MppApi		  *mpi;
@@ -138,7 +140,7 @@ int drm_fd = 0;
 pthread_mutex_t video_mutex;
 pthread_cond_t video_cond;
 extern bool osd_update_ready;
-std::atomic<bool> drone_connected = false;
+std::atomic<bool> video_present = false;
 int video_zpos = 1;
 
 bool update_osd_video_size = false;
@@ -147,6 +149,7 @@ bool osd_custom_message = false;
 bool disable_vsync = false;
 uint32_t refresh_frequency_ms = 1000;
 
+std::atomic<uint64_t> last_demux_output_ms{0};
 std::atomic<bool> codec_detected = false;
 std::atomic<bool> codec_changed = false;
 pthread_t tid_frame;
@@ -268,6 +271,20 @@ void init_buffer(MppFrame frame) {
 	if (dvr != NULL){
 		dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height, codec);
 	}
+}
+
+void clear_video_runtime_facts()
+{
+    void *batch = osd_batch_init(6);
+
+    osd_add_clear_fact(batch, "video.displayed_frame", nullptr, 0);
+    osd_add_clear_fact(batch, "rtp.received_bytes", nullptr, 0);
+    osd_add_clear_fact(batch, "video.width", nullptr, 0);
+    osd_add_clear_fact(batch, "video.height", nullptr, 0);
+    osd_add_clear_fact(batch, "video.decode_and_handover_ms", nullptr, 0);
+    osd_add_clear_fact(batch, "video.decoder_feed_time_ms", nullptr, 0);
+
+    osd_publish_batch(batch);
 }
 
 // __FRAME_THREAD__
@@ -680,16 +697,25 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
 	setup_mpi(packet);
 	
 	codec_detected.store(true);
+	last_demux_output_ms.store(0);
 
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
 	auto cb=[&packet, &rtp_receiver, /*&decoder_stalled_count,*/ &bytes_received, &period_start](void *data, int size, bool is_codec_changed){
+		uint64_t now = get_time_ms();
+		last_demux_output_ms.store(now);
+
+        if (!video_present.load()) {
+            spdlog::info("Video stream detected");
+            video_present.store(true);
+        }
+
 		if (is_codec_changed)
 		{
 			codec_changed.store(true);
 		}
 		bytes_received += size;
-		uint64_t now = get_time_ms();
+		
 		osd_publish_uint_fact("rtp.received_bytes", NULL, 0, size);
         feed_packet_to_decoder(packet, data, size);
         if (dvr_enabled && dvr != NULL && codec == VideoCodec::H265) {
@@ -699,30 +725,49 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
         }
     };
 	rtp_receiver->start_receiving(cb);
+
 	// TODO: DVR Recording allowed only for H265 due unclear bug in librtp we receive corrupted data for H264 codec and due to that dvr can't write data correctly
 	if (dvr_autostart && dvr != NULL && codec == VideoCodec::H265) {
 		dvr->start_recording();
 	}
 
-    while (!signal_flag){
-		if (codec_changed.load())
-		{
-			rtp_receiver->stop_receiving();
-			mpp_packet_set_eos(packet);
-			mpp_packet_set_length(packet, 0);
-			int ret=0;
-			while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
-				usleep(10000);
-			}
-			restart_mpi(packet, rtp_receiver->get_video_codec());
-			rtp_receiver->start_receiving(cb);
-		}
-        else {
-            if (!drone_connected.load()) {
-                update_osd_video_size = true;
+    while (!signal_flag) {
+		if (codec_changed.load()) {
+            rtp_receiver->stop_receiving();
+
+            mpp_packet_set_eos(packet);
+            mpp_packet_set_length(packet, 0);
+
+            int ret = 0;
+            while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
+                usleep(10000);
             }
-            sleep(10);
-		}
+
+            restart_mpi(packet, rtp_receiver->get_video_codec());
+
+            last_demux_output_ms.store(0);
+            video_present.store(false);
+            update_osd_video_size = true;
+
+            rtp_receiver->start_receiving(cb);
+        } else {
+            uint64_t now = get_time_ms();
+            uint64_t last = last_demux_output_ms.load();
+
+            bool has_video = (last != 0) && ((now - last) <= NO_VIDEO_TIMEOUT_MS);
+
+            if (!has_video) {
+                if (video_present.load()) {
+                    spdlog::info("Video stream lost (no packets for {} sec)", NO_VIDEO_TIMEOUT_MS / 1000);
+                    video_present.store(false);
+                    update_osd_video_size = true;
+
+                    clear_video_runtime_facts();
+                    clear_osd_wfbcli();
+                }
+            }
+            sleep(1);
+        }
     }
 	rtp_receiver->stop_receiving();
     spdlog::info("Feeding eos");
@@ -781,16 +826,16 @@ void printHelp() {
     "\n"
 	"    --target-frame-rate <fps> - Target DRM refresh rate for mode selection (30..120), ex: 60\n"
 	"                                Makes DRM choose the highest available resolution at the requested FPS\n"
-	"                                For optimal smoothness, use a value equal to or divisible by the video FPS.\n"
+	"                                For optimal smoothness, use a value equal to or divisible by the video FPS\n"
     "\n"
 	"    --disable-vsync           - Disable VSYNC commits\n"
 	"\n"
-    "    --screen-mode-list        - Print the list of supported screen modes and exit.\n"
+    "    --screen-mode-list        - Print the list of supported screen modes and exit\n"
     "\n"
     "    --wfb-api-port            - Port of wfb-server for cli statistics. (Default: 8003)\n"
 	"                                Use \"0\" to disable this stats\n"
     "\n"
-    "    --screensaver-image       - Path to image that will shown on screensaver.\n"
+	"    --screensaver-image       - Path to a PNG image to display on the screensaver\n"
     "\n"
     "    --version                 - Show program version\n"
     "\n", APP_VERSION_MAJOR, APP_VERSION_MINOR
