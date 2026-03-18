@@ -921,9 +921,20 @@ public:
 class VideoWidget: public IconTplTextWidget {
 public:
   VideoWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
-              cairo_surface_t *icon, std::string tpl, uint num_args) :
+              cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
 		IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
-		fps(window_size_ms, bucket_size_ms) {};
+        fps_(window_size_ms, bucket_size_ms)
+    {
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MIN_WIDGET_REFRESH_RATE) {
+            spdlog::warn("VideoWidget: Refresh rate '{}' is out of range [{} {}].",
+                refresh_rate, refresh_frequency_ms, MIN_WIDGET_REFRESH_RATE);
+            spdlog::warn("VideoWidget: Using osd refresh rate: {}", refresh_frequency_ms);
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
+        }
+        else {
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_rate);
+        }
+    }
 
 	virtual void setFact(uint idx, Fact fact) {
 		if (idx == 0) {
@@ -934,25 +945,46 @@ public:
             }
 			// replace the value with its increment rate per-second
 			ulong num_frames = fact.getUintValue(); // should be always '1'
-			fps.add(num_frames);
-			args[idx] = Fact(FactMeta("video_fps"), (ulong)fps.rate_per_second_over_last_ms(1000));
+            fps_.add(num_frames);
+
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = now - last_drawn_;
+            
+            if (elapsed < refresh_rate_ms_) {
+                return;
+            }
+            last_drawn_ = now;
+
+            args[idx] = Fact(FactMeta("video_fps"), (ulong)fps_.rate_per_second_over_last_ms(1000));
 		} else {
 			args[idx] = fact;
 		}
 	}
 
 private:
-	RunningAverage fps;
+    RunningAverage fps_;
+    std::chrono::milliseconds refresh_rate_ms_{};
+    std::chrono::steady_clock::time_point last_drawn_{};
 };
 
 class VideoBitrateWidget: public IconTplTextWidget {
 public:
   VideoBitrateWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
-					 cairo_surface_t *icon, std::string tpl, uint num_args) :
-		IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
-		bps(window_size_ms, bucket_size_ms) {
-	  assert(num_args == 1);
-  };
+                     cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
+        IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
+        bps_(window_size_ms, bucket_size_ms)
+    {
+        assert(num_args == 1);
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MIN_WIDGET_REFRESH_RATE) {
+            spdlog::warn("VideoBitrateWidget: Refresh rate '{}' is out of range [{} {}].",
+                refresh_rate, refresh_frequency_ms, MIN_WIDGET_REFRESH_RATE);
+            spdlog::warn("VideoBitrateWidget: Using osd refresh rate: {}", refresh_frequency_ms);
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
+        }
+        else {
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_rate);
+        }
+    }
 
 	virtual void setFact(uint idx, Fact fact) {
 		assert(idx == 0);
@@ -963,36 +995,68 @@ public:
         }
 		// replace the value with its increment rate per-second
 		ulong num_bytes = fact.getUintValue();
-		bps.add(num_bytes);
-		// 125000 is 1_000_000 / 8 (megabits, not megabytes)
-		args[idx] = Fact(FactMeta("video_mbps"), bps.rate_per_second_over_last_ms(1000) / 125000.0);
-	}
+        bps_.add(num_bytes);
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = now - last_drawn_;
+            
+        if (elapsed < refresh_rate_ms_) {
+            return;
+        }
+        last_drawn_ = now;
+
+        // 125000 is 1_000_000 / 8 (megabits, not megabytes)
+        args[idx] = Fact(FactMeta("video_mbps"), bps_.rate_per_second_over_last_ms(1000) / 125000.0);
+    }
 
 private:
-	RunningAverage bps;
+    RunningAverage bps_;
+    std::chrono::milliseconds refresh_rate_ms_{};
+    std::chrono::steady_clock::time_point last_drawn_{};
 };
 
 class VideoDecodeLatencyWidget: public IconTplTextWidget {
 public:
   VideoDecodeLatencyWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
-					 cairo_surface_t *icon, std::string tpl, uint num_args) :
-		IconTplTextWidget(pos_x, pos_y, icon, tpl, 3),  // 3 args, because we calculate min/max/avg
-		timing(window_size_ms, bucket_size_ms) {
-	  assert(num_args == 1);
-  };
+                           cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
+        IconTplTextWidget(pos_x, pos_y, icon, tpl, 3),  // 3 args, because we calculate min/max/avg
+        timing_(window_size_ms, bucket_size_ms)
+    {
+        assert(num_args == 1);
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MIN_WIDGET_REFRESH_RATE) {
+            spdlog::warn("VideoDecodeLatencyWidget: Refresh rate '{}' is out of range [{} {}].",
+                refresh_rate, refresh_frequency_ms, MIN_WIDGET_REFRESH_RATE);
+            spdlog::warn("VideoDecodeLatencyWidget: Using osd refresh rate: {}", refresh_frequency_ms);
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
+        }
+        else {
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_rate);
+        }
+    }
 
 	virtual void setFact(uint idx, Fact fact) {
 		assert(idx == 0);
 		ulong decode_time = fact.getUintValue();
-		timing.add(decode_time);
-		Stats stats = timing.get_stats_over_last_ms_result(1000);
+        timing_.add(decode_time);
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = now - last_drawn_;
+            
+        if (elapsed < refresh_rate_ms_) {
+            return;
+        }
+        last_drawn_ = now;
+
+        Stats stats = timing_.get_stats_over_last_ms_result(1000);
 		args[0] = Fact(FactMeta("video_avg"), stats.average);
 		args[1] = Fact(FactMeta("video_min"), stats.min);
 		args[2] = Fact(FactMeta("video_max"), stats.max);
 	}
 
 private:
-	RunningAverage timing;
+    RunningAverage timing_;
+    std::chrono::milliseconds refresh_rate_ms_{};
+    std::chrono::steady_clock::time_point last_drawn_{};
 };
 
 
@@ -1378,31 +1442,34 @@ public:
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
-				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
+                uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.at("refresh_rate_ms").template get<uint>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoWidget(x, y, window_size_s * 1000, bucket_size_ms,
-										  icon, tpl, (uint)matchers.size()),
+                                          icon, tpl, refresh_rate_ms, (uint)matchers.size()),
 						  matchers);
 			} else if(type == "VideoBitrateWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
-				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
+                uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.at("refresh_rate_ms").template get<uint>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoBitrateWidget(x, y, window_size_s * 1000, bucket_size_ms,
-												 icon, tpl, (uint)matchers.size()),
+                                                 icon, tpl, refresh_rate_ms, (uint)matchers.size()),
 						  matchers);
 			} else if(type == "VideoDecodeLatencyWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
-				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
+                uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.at("refresh_rate_ms").template get<uint>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoDecodeLatencyWidget(x, y, window_size_s * 1000, bucket_size_ms,
-													   icon, tpl, 1),
+                                                       icon, tpl, refresh_rate_ms, 1),
 						  matchers);
 			} else if(type == "BoxWidget") {
 				auto width = widget_j.at("width").template get<uint>();
