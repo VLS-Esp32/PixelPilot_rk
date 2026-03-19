@@ -157,6 +157,7 @@ to display any fact (as long as datatype matches):
 * `IconTextWidget` - displays a graphical icon followed by a static text
 * `TplTextWidget` - displays a string of text by replacing placeholders with the fact values
 * `IconTplTextWidget` - displays a graphical icon followed by templatized text string
+* `IconTplStatusWidget` - displays a graphical icon that visualized in white or gray color and text by replacing placeholders with the fact values
 * `BoxWidget` - displays a static square. Might be good as a background.
 * `BarChartWidget` - displays a simple bar chart for the single fact's statistics. Each bar represents
  either minimum or maximum or sum or count or average of the fact over time interval. Can be used to show
