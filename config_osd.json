@@ -11,7 +11,7 @@
       "template": "%u fps | %ux%u",
       "per_second_window_s": 2,
       "per_second_bucket_ms": 200,
-      "refresh_rate_ms": 200,
+      "refresh_rate_ms": 250,
       "facts": [
         { "name": "video.displayed_frame" },
         { "name": "video.width" },
@@ -27,7 +27,7 @@
       "template": "%f Mbps",
       "per_second_window_s": 2,
       "per_second_bucket_ms": 100,
-      "refresh_rate_ms": 200,
+      "refresh_rate_ms": 250,
       "facts": [
         { "name": "rtp.received_bytes" }
       ]
@@ -58,7 +58,7 @@
       "x": -75,
       "y": -24,
       "icon_path": "tower-cell.png",
-      "template": "%i",
+      "template": "%u",
       "facts": [
         { "name": "wfbcli.cli.connected" },
         { "name": "wfbcli.rx.ant_count", "tags": {"id": "video rx"}}

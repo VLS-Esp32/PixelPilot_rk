@@ -925,9 +925,9 @@ public:
 		IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
         fps_(window_size_ms, bucket_size_ms)
     {
-        if (refresh_rate < refresh_frequency_ms || refresh_rate > MIN_WIDGET_REFRESH_RATE) {
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MAX_WIDGET_REFRESH_MS) {
             spdlog::warn("VideoWidget: Refresh rate '{}' is out of range [{} {}].",
-                refresh_rate, refresh_frequency_ms, MIN_WIDGET_REFRESH_RATE);
+                refresh_rate, refresh_frequency_ms, MAX_WIDGET_REFRESH_MS);
             spdlog::warn("VideoWidget: Using osd refresh rate: {}", refresh_frequency_ms);
             refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
         }
@@ -975,9 +975,9 @@ public:
         bps_(window_size_ms, bucket_size_ms)
     {
         assert(num_args == 1);
-        if (refresh_rate < refresh_frequency_ms || refresh_rate > MIN_WIDGET_REFRESH_RATE) {
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MAX_WIDGET_REFRESH_MS) {
             spdlog::warn("VideoBitrateWidget: Refresh rate '{}' is out of range [{} {}].",
-                refresh_rate, refresh_frequency_ms, MIN_WIDGET_REFRESH_RATE);
+                refresh_rate, refresh_frequency_ms, MAX_WIDGET_REFRESH_MS);
             spdlog::warn("VideoBitrateWidget: Using osd refresh rate: {}", refresh_frequency_ms);
             refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
         }
@@ -1023,9 +1023,9 @@ public:
         timing_(window_size_ms, bucket_size_ms)
     {
         assert(num_args == 1);
-        if (refresh_rate < refresh_frequency_ms || refresh_rate > MIN_WIDGET_REFRESH_RATE) {
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MAX_WIDGET_REFRESH_MS) {
             spdlog::warn("VideoDecodeLatencyWidget: Refresh rate '{}' is out of range [{} {}].",
-                refresh_rate, refresh_frequency_ms, MIN_WIDGET_REFRESH_RATE);
+                refresh_rate, refresh_frequency_ms, MAX_WIDGET_REFRESH_MS);
             spdlog::warn("VideoDecodeLatencyWidget: Using osd refresh rate: {}", refresh_frequency_ms);
             refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
         }
@@ -1036,6 +1036,13 @@ public:
 
 	virtual void setFact(uint idx, Fact fact) {
 		assert(idx == 0);
+
+		if (!fact.isDefined()) {
+        	args[0] = Fact();
+        	args[1] = Fact();
+        	args[2] = Fact();
+        	return;
+    	}
 		ulong decode_time = fact.getUintValue();
         timing_.add(decode_time);
 
@@ -1443,7 +1450,7 @@ public:
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
                 uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
-                uint refresh_rate_ms = widget_j.at("refresh_rate_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoWidget(x, y, window_size_s * 1000, bucket_size_ms,
@@ -1454,7 +1461,7 @@ public:
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
                 uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
-                uint refresh_rate_ms = widget_j.at("refresh_rate_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoBitrateWidget(x, y, window_size_s * 1000, bucket_size_ms,
@@ -1465,7 +1472,7 @@ public:
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
                 uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
-                uint refresh_rate_ms = widget_j.at("refresh_rate_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoDecodeLatencyWidget(x, y, window_size_s * 1000, bucket_size_ms,

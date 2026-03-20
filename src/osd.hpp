@@ -31,7 +31,7 @@ typedef struct {
 
 extern int osd_thread_signal;
 
-#define MIN_WIDGET_REFRESH_RATE 2000 // 2 sec
+#define MAX_WIDGET_REFRESH_MS 2000 // 2 sec
 
 #define SHM_BUFFERS_COUNT 3
 
