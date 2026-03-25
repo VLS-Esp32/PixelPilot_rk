@@ -212,10 +212,12 @@ int process_rx(const msgpack::object& packet) {
     std::string id;
     msgpack::object packets;
     msgpack::object rx_ant_stats;
+
+    std::unordered_set<uint64_t> ant_ids;
     
     int64_t total_rssi_avg = 0;
     int64_t total_snr_avg = 0;
-    size_t ant_count = 0;
+    size_t  ant_count = 0;
     int32_t best_rssi_avg = -130;
     int32_t best_snr_avg = 0;
 
@@ -231,7 +233,6 @@ int process_rx(const msgpack::object& packet) {
             packets = packet.via.map.ptr[i].val;
         } else if (key == "rx_ant_stats") {
             rx_ant_stats = packet.via.map.ptr[i].val;
-            ant_count = rx_ant_stats.via.map.size;
         }
     }
 
@@ -248,7 +249,7 @@ int process_rx(const msgpack::object& packet) {
     }
 
     // Process rx_ant_stats
-    for (size_t i = 0; i < ant_count; ++i) {
+    for (size_t i = 0; i < rx_ant_stats.via.map.size; ++i) {
         // Extract the key (which is an array: [[frequency, mcs, bandwidth], antenna_id])
         msgpack::object_array key_array = rx_ant_stats.via.map.ptr[i].key.via.array;
 
@@ -278,6 +279,12 @@ int process_rx(const msgpack::object& packet) {
         int32_t snr_avg = value_array.ptr[5].as<int32_t>();
         int32_t snr_max = value_array.ptr[6].as<int32_t>();
 
+        if (ant_ids.find(antenna_id) != ant_ids.end()) {
+            continue;
+        }
+
+        ant_ids.insert(antenna_id);
+
         total_rssi_avg += rssi_avg;
         total_snr_avg += snr_avg;
 
@@ -299,6 +306,8 @@ int process_rx(const msgpack::object& packet) {
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg", tags, 2, snr_avg);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_max", tags, 2, snr_max);
     }
+
+    ant_count = ant_ids.size();
 
     static auto prev_time = std::chrono::steady_clock::now();
     auto current_time = std::chrono::steady_clock::now();
