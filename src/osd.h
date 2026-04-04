@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-extern int enable_osd;
+extern bool enable_osd;
 extern bool osd_custom_message;
 extern pthread_mutex_t osd_mutex;
 
@@ -28,6 +28,7 @@ void osd_add_int_fact(void *batch, char const *name, osd_tag *tags, int n_tags, 
 void osd_add_uint_fact(void *batch, char const *name, osd_tag *tags, int n_tags, ulong value);
 void osd_add_double_fact(void *batch, char const *name, osd_tag *tags, int n_tags, double value);
 void osd_add_str_fact(void *batch, char const *name, osd_tag *tags, int n_tags, const char *value);
+void osd_add_clear_fact(void *batch, char const *name, osd_tag *tags, int n_tags);
 
 // Publish individual facts
 void osd_publish_bool_fact(char const *name, osd_tag *tags, int n_tags, bool value);
@@ -35,6 +36,7 @@ void osd_publish_int_fact(char const *name, osd_tag *tags, int n_tags, long valu
 void osd_publish_uint_fact(char const *name, osd_tag *tags, int n_tags, ulong value);
 void osd_publish_double_fact(char const *name, osd_tag *tags, int n_tags, double value);
 void osd_publish_str_fact(char const *name, osd_tag *tags, int n_tags, const char *value);
+void osd_clear_fact(char const *name, osd_tag *tags, int n_tags);
 #ifdef __cplusplus
 }
 #endif

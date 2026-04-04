@@ -9,8 +9,11 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h> // for close
+#include <inttypes.h>
 #include <chrono>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -28,20 +31,193 @@ extern "C" {
 #define BUFFER_SIZE 10 * 1024
 
 int wfb_thread_signal = 0;
+bool cli_connected = false;
+
+std::unordered_set<uint64_t> seen_rx_ant_ids;
+std::unordered_set<uint64_t> seen_tx_ant_ids;
+std::unordered_set<std::string> seen_rx_ids;
+std::unordered_set<std::string> seen_tx_ids;
+
+inline void store_rx_ant_id(uint64_t ant_id)
+{
+    seen_rx_ant_ids.insert(ant_id);
+}
+
+inline void store_tx_ant_id(uint64_t ant_id)
+{
+    seen_tx_ant_ids.insert(ant_id);
+}
+
+void clear_wfbcli_rx_link_facts(const char *id)
+{
+    osd_tag tags[2];
+    int n_tags = 0;
+
+    if (id && *id) {
+        strcpy(tags[0].key, "id");
+        strncpy(tags[0].val, id, sizeof(tags[0].val) - 1);
+        tags[0].val[sizeof(tags[0].val) - 1] = '\0';
+        n_tags = 1;
+    } else {
+        return;
+    }
+    
+    void *batch = osd_batch_init(64);
+
+    // RX packets
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.all.delta",      tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.all.total",      tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.out.delta",      tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.out.total",      tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.session.delta",  tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.session.total",  tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.fec_rec.delta",  tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.fec_rec.total",  tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.lost.delta",     tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.lost.total",     tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.dec_err.delta",  tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.dec_err.total",  tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.bad.delta",      tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.bad.total",      tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.all_bytes.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.all_bytes.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.out_bytes.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.out_bytes.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.data.delta",      tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.data.total",      tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.uniq.delta",      tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.packets.uniq.total",      tags, n_tags);
+
+    // RX antenna global stats
+    osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_global", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.snr_avg_global",  tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_best",   tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.snr_avg_best",    tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.rx.ant_count",                 tags, n_tags);
+
+    strcpy(tags[1].key, "ant_id");
+    n_tags = 2;
+    for (uint64_t ant_id : seen_rx_ant_ids) {
+        snprintf(tags[1].val, sizeof(tags[1].val), "%" PRIu64, ant_id);
+
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.freq",     tags, n_tags);
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.mcs",      tags, n_tags);
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.bw",       tags, n_tags);
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.pkt_recv", tags, n_tags);
+
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.rssi_min", tags, n_tags);
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.rssi_avg", tags, n_tags);
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.rssi_max", tags, n_tags);
+
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.snr_min",  tags, n_tags);
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.snr_avg",  tags, n_tags);
+        osd_add_clear_fact(batch, "wfbcli.rx.ant_stats.snr_max",  tags, n_tags);
+    }
+    osd_publish_batch(batch);
+}
+
+static void clear_wfbcli_tx_link_facts(const char *id)
+{
+    osd_tag tags[2];
+    int n_tags = 0;
+
+    if (id && *id) {
+        strcpy(tags[0].key, "id");
+        strncpy(tags[0].val, id, sizeof(tags[0].val) - 1);
+        tags[0].val[sizeof(tags[0].val) - 1] = '\0';
+        n_tags = 1;
+    } else {
+        return;
+    }
+
+    void *batch = osd_batch_init(64);
+
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.fec_timeouts.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.fec_timeouts.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.incoming.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.incoming.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.incoming_bytes.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.incoming_bytes.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.injected.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.injected.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.injected_bytes.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.injected_bytes.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.dropped.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.dropped.total", tags, n_tags);
+
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.truncated.delta", tags, n_tags);
+    osd_add_clear_fact(batch, "wfbcli.tx.packets.truncated.total", tags, n_tags);
+
+    strcpy(tags[1].key, "ant_id");
+    n_tags = 2;
+    for (uint64_t ant_id : seen_tx_ant_ids) {
+        snprintf(tags[1].val, sizeof(tags[1].val), "%" PRIu64, ant_id);
+        osd_add_clear_fact(batch, "wfbcli.rf_temperature", tags, n_tags);
+    }
+    osd_publish_batch(batch);
+}
+
+
+void clear_wfbcli_cli_header_facts()
+{
+    void *batch = osd_batch_init(8);
+
+    osd_add_clear_fact(batch, "wfbcli.cli_title", nullptr, 0);
+    osd_add_clear_fact(batch, "wfbcli.is_cluster", nullptr, 0);
+    osd_add_clear_fact(batch, "wfbcli.temp_overheat_warning", nullptr, 0);
+
+    osd_publish_batch(batch);
+}
+
+void clear_osd_wfbcli()
+{
+    for (const auto &id : seen_rx_ids) {
+        clear_wfbcli_rx_link_facts(id.c_str());
+    }
+
+    seen_rx_ant_ids.clear();
+    seen_rx_ids.clear();
+
+    for (const auto &id : seen_tx_ids) {
+        clear_wfbcli_tx_link_facts(id.c_str());
+    }
+
+    seen_tx_ant_ids.clear();
+    seen_tx_ids.clear();
+
+    clear_wfbcli_cli_header_facts();
+}
 
 int process_rx(const msgpack::object& packet) {
 
-    void *batch = osd_batch_init(2);
+    void *batch = osd_batch_init(16);
     osd_tag tags[2];
 
     // Access the map and find the required keys
     std::string id;
     msgpack::object packets;
     msgpack::object rx_ant_stats;
+
+    std::unordered_set<uint64_t> ant_ids;
     
     int64_t total_rssi_avg = 0;
     int64_t total_snr_avg = 0;
-    size_t ant_count = 0;
+    size_t  ant_count = 0;
     int32_t best_rssi_avg = -130;
     int32_t best_snr_avg = 0;
 
@@ -49,13 +225,14 @@ int process_rx(const msgpack::object& packet) {
         std::string key = packet.via.map.ptr[i].key.as<std::string>();
         if (key == "id") {
             id = packet.via.map.ptr[i].val.as<std::string>();
+            seen_rx_ids.insert(id);
             strcpy(tags[0].key, "id");
-            strcpy(tags[0].val, id.c_str());
+            strncpy(tags[0].val, id.c_str(), sizeof(tags[0].val) - 1);
+            tags[0].val[sizeof(tags[0].val) - 1] = '\0';
         } else if (key == "packets") {
             packets = packet.via.map.ptr[i].val;
         } else if (key == "rx_ant_stats") {
             rx_ant_stats = packet.via.map.ptr[i].val;
-            ant_count = rx_ant_stats.via.map.size;
         }
     }
 
@@ -72,7 +249,7 @@ int process_rx(const msgpack::object& packet) {
     }
 
     // Process rx_ant_stats
-    for (size_t i = 0; i < ant_count; ++i) {
+    for (size_t i = 0; i < rx_ant_stats.via.map.size; ++i) {
         // Extract the key (which is an array: [[frequency, mcs, bandwidth], antenna_id])
         msgpack::object_array key_array = rx_ant_stats.via.map.ptr[i].key.via.array;
 
@@ -86,9 +263,10 @@ int process_rx(const msgpack::object& packet) {
 
         // Extract the second element of the key (antenna_id)
         uint64_t antenna_id = key_array.ptr[1].as<uint64_t>();
+        seen_rx_ant_ids.insert(antenna_id);
 
         strcpy(tags[1].key, "ant_id");
-        snprintf(tags[1].val, sizeof(tags[0].val), "%u", antenna_id);
+        snprintf(tags[1].val, sizeof(tags[1].val), "%" PRIu64, antenna_id);
 
         // Extract the value (which is an array: [packets_delta, rssi_min, rssi_avg, rssi_max, snr_min, snr_avg, snr_max])
         msgpack::object_array value_array = rx_ant_stats.via.map.ptr[i].val.via.array;
@@ -100,6 +278,12 @@ int process_rx(const msgpack::object& packet) {
         int32_t snr_min = value_array.ptr[4].as<int32_t>();
         int32_t snr_avg = value_array.ptr[5].as<int32_t>();
         int32_t snr_max = value_array.ptr[6].as<int32_t>();
+
+        if (ant_ids.find(antenna_id) != ant_ids.end()) {
+            continue;
+        }
+
+        ant_ids.insert(antenna_id);
 
         total_rssi_avg += rssi_avg;
         total_snr_avg += snr_avg;
@@ -123,12 +307,10 @@ int process_rx(const msgpack::object& packet) {
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_max", tags, 2, snr_max);
     }
 
+    ant_count = ant_ids.size();
+
     static auto prev_time = std::chrono::steady_clock::now();
     auto current_time = std::chrono::steady_clock::now();
-    // check difference between packets more then 3 sec if true set drone connection lost
-    if (std::chrono::duration_cast<std::chrono::seconds>(current_time - prev_time).count() > 3) {
-        osd_add_bool_fact(batch, "wfbcli.drone.connected", tags, 1, false);
-    }
 
     if (ant_count > 0) {
         int32_t avg_rssi = total_rssi_avg / (int32_t)ant_count;
@@ -137,8 +319,14 @@ int process_rx(const msgpack::object& packet) {
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_global", tags, 1, avg_snr);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.rssi_avg_best", tags, 1, best_rssi_avg);
         osd_add_int_fact(batch, "wfbcli.rx.ant_stats.snr_avg_best", tags, 1, best_snr_avg);
+        osd_add_uint_fact(batch, "wfbcli.rx.ant_count", tags, 1, (uint64_t)ant_count);
         osd_add_bool_fact(batch, "wfbcli.drone.connected", tags, 1, true);
         prev_time = current_time;
+    }
+
+    // check difference between packets more then 3 sec if true set drone connection lost
+    if (std::chrono::duration_cast<std::chrono::seconds>(current_time - prev_time).count() > 3) {
+        osd_add_bool_fact(batch, "wfbcli.drone.connected", tags, 1, false);
     }
 
     osd_publish_batch(batch);
@@ -147,7 +335,7 @@ int process_rx(const msgpack::object& packet) {
 
 int process_tx(const msgpack::object& packet) {
 
-    void *batch = osd_batch_init(2);
+    void *batch = osd_batch_init(16);
     osd_tag tags[2];
 
     // Access the map and find the required keys
@@ -162,8 +350,10 @@ int process_tx(const msgpack::object& packet) {
         std::string key = packet.via.map.ptr[i].key.as<std::string>();
         if (key == "id") {
             id = packet.via.map.ptr[i].val.as<std::string>();
+            seen_tx_ids.insert(id);
             strcpy(tags[0].key, "id");
-            strcpy(tags[0].val, id.c_str());
+            strncpy(tags[0].val, id.c_str(), sizeof(tags[0].val) - 1);
+            tags[0].val[sizeof(tags[0].val) - 1] = '\0';
         } else if (key == "packets") {
             packets = packet.via.map.ptr[i].val;
         } else if (key == "latency") {
@@ -223,8 +413,9 @@ int process_tx(const msgpack::object& packet) {
 	for (size_t i = 0; i < rf_temperature.via.map.size; ++i) {
         int antenna_id = rf_temperature.via.map.ptr[i].key.as<int>();
 		int temperature = rf_temperature.via.map.ptr[i].val.as<int>();
-		strcpy(tags[1].key, "ant_id");
-		snprintf(tags[1].val, sizeof(tags[0].val), "%u", antenna_id);
+        seen_tx_ant_ids.insert(antenna_id);
+        strcpy(tags[1].key, "ant_id");
+        snprintf(tags[1].val, sizeof(tags[1].val), "%" PRIu64, antenna_id);
 		osd_add_uint_fact(batch, "wfbcli.rf_temperature", tags, 2, temperature);
     }	
 
@@ -337,7 +528,8 @@ int reconnect_to_server(int port) {
 			if (inet_pton(AF_INET, SERVER_IP, &server_address.sin_addr) > 0) {
 				if (connect(sock, (struct sockaddr *)&server_address, sizeof(server_address)) == 0) {
 					SPDLOG_DEBUG("Successfully connected to WFB API server.");
-                    osd_publish_bool_fact("wfbcli.rx.connected", NULL, 0, true);
+                    osd_publish_bool_fact("wfbcli.cli.connected", NULL, 0, true);
+                    cli_connected = true;
 					return sock;
 				} else {
 					SPDLOG_ERROR("Connection failed");
@@ -348,6 +540,11 @@ int reconnect_to_server(int port) {
 
 			close(sock); // Clean up the socket if connection fails
 		}
+
+        if (cli_connected){
+            clear_osd_wfbcli();
+            cli_connected = false;
+        }
 
 		SPDLOG_WARN("Reconnection failed. Retrying in 1 second");
 		std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -361,7 +558,7 @@ void *__WFB_CLI_THREAD__(void *param) {
 
 	while (!wfb_thread_signal) {
         void *batch = osd_batch_init(2);
-        osd_add_bool_fact(batch, "wfbcli.rx.connected", NULL, 0, false);
+        osd_add_bool_fact(batch, "wfbcli.cli.connected", NULL, 0, false);
         osd_add_bool_fact(batch, "wfbcli.drone.connected", NULL, 0, false);
         osd_publish_batch(batch);
 		int sock = reconnect_to_server(p->port);

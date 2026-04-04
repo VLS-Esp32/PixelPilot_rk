@@ -30,6 +30,10 @@
 #include "rtp-demuxer.h"
 #include "rtp-profile.h"
 
+extern "C" {
+#include "osd.h"
+}
+
 // Main callback for packet processing after codec is known
 static int main_rtp_cb(void* param, const void* packet, int bytes, uint32_t timestamp, int flags)
 {
@@ -155,7 +159,9 @@ void RtpReceiver::rtp_receiver_thread()
     while (this->m_running->load()) {
         int ret = poll(fds, 1, 1000);
         if (ret < 0) { if (errno == EINTR) continue; perror("poll"); break; }
-        if (ret == 0) continue;
+        if (ret == 0) {
+            continue;
+        }
         if (fds[0].revents & POLLIN) {
             struct sockaddr_in peer; socklen_t len = sizeof(peer);
             ssize_t n = recvfrom(m_socket, buffer, sizeof(buffer), 0, (struct sockaddr*)&peer, &len);

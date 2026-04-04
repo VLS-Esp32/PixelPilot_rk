@@ -59,6 +59,8 @@ extern "C" {
 
 #define CODEC_ALIGN(x, a)   (((x)+(a)-1)&~((a)-1))
 
+#define NO_VIDEO_TIMEOUT_MS 15000
+
 struct {
 	MppCtx		  ctx;
 	MppApi		  *mpi;
@@ -97,6 +99,7 @@ enum AppOption {
     OPT_DISABLE_VSYNC,
     OPT_SCREEN_MODE_LIST,
     OPT_WFB_API_PORT,
+    OPT_SCREENSAVER_IMG,
     OPT_VERSION
 };
 
@@ -123,6 +126,7 @@ static const struct option pixelpilot_long_options[] = {
     {"disable-vsync",       no_argument,       0, OPT_DISABLE_VSYNC},
     {"screen-mode-list",    no_argument,       0, OPT_SCREEN_MODE_LIST},
     {"wfb-api-port",        required_argument, 0, OPT_WFB_API_PORT},
+    {"screensaver-image",   required_argument, 0, OPT_SCREENSAVER_IMG},
     {"version",             no_argument,       0, OPT_VERSION},
     {"help",                no_argument,       0, 'h'},
     {0, 0, 0, 0}
@@ -136,13 +140,16 @@ int drm_fd = 0;
 pthread_mutex_t video_mutex;
 pthread_cond_t video_cond;
 extern bool osd_update_ready;
+std::atomic<bool> video_present = false;
 int video_zpos = 1;
 
+bool update_osd_video_size = false;
 bool mavlink_dvr_on_arm = false;
 bool osd_custom_message = false;
 bool disable_vsync = false;
 uint32_t refresh_frequency_ms = 1000;
 
+std::atomic<uint64_t> last_demux_output_ms{0};
 std::atomic<bool> codec_detected = false;
 std::atomic<bool> codec_changed = false;
 pthread_t tid_frame;
@@ -232,7 +239,7 @@ void init_buffer(MppFrame frame) {
 		info.fd = dph.fd;
 		ret = mpp_buffer_commit(mpi.frm_grp, &info);
 		assert(!ret);
-		mpi.frame_to_drm[i].prime_fd = info.fd; // dups fd						
+		mpi.frame_to_drm[i].prime_fd = info.fd; // dups fd
 		if (dph.fd != info.fd) {
 			ret = close(dph.fd);
 			assert(!ret);
@@ -245,7 +252,7 @@ void init_buffer(MppFrame frame) {
 		memset(offsets, 0, sizeof(offsets));
 		handles[0] = mpi.frame_to_drm[i].handle;
 		offsets[0] = 0;
-		pitches[0] = hor_stride;						
+		pitches[0] = hor_stride;
 		handles[1] = mpi.frame_to_drm[i].handle;
 		offsets[1] = pitches[0] * ver_stride;
 		pitches[1] = pitches[0];
@@ -264,6 +271,20 @@ void init_buffer(MppFrame frame) {
 	if (dvr != NULL){
 		dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height, codec);
 	}
+}
+
+void clear_video_runtime_facts()
+{
+    void *batch = osd_batch_init(6);
+
+    osd_add_clear_fact(batch, "video.displayed_frame", nullptr, 0);
+    osd_add_clear_fact(batch, "rtp.received_bytes", nullptr, 0);
+    osd_add_clear_fact(batch, "video.width", nullptr, 0);
+    osd_add_clear_fact(batch, "video.height", nullptr, 0);
+    osd_add_clear_fact(batch, "video.decode_and_handover_ms", nullptr, 0);
+    osd_add_clear_fact(batch, "video.decoder_feed_time_ms", nullptr, 0);
+
+    osd_publish_batch(batch);
 }
 
 // __FRAME_THREAD__
@@ -308,7 +329,7 @@ void *__FRAME_THREAD__(void *param)
 					mpi.first_frame_ts = ats;
 				}
 
-				MppBuffer buffer = mpp_frame_get_buffer(frame);					
+				MppBuffer buffer = mpp_frame_get_buffer(frame);
 				if (buffer) {
 					output_list->video_poc = mpp_frame_get_poc(frame);
 					uint64_t feed_data_ts =  mpp_frame_get_pts(frame);
@@ -388,18 +409,26 @@ void *__DISPLAY_THREAD__(void *param)
 			assert(ret>0);
 		}
 
-		if(enable_osd) {
-			ret = pthread_mutex_lock(&osd_mutex);
-			assert(!ret);		
-			ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
-			assert(ret>0);
-		}
-		drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
-		ret = pthread_mutex_unlock(&osd_mutex);
-		assert(!ret);
-		osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
-		uint64_t decode_and_handover_display_ms=get_time_ms()-decoding_pts;
-		osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
+        ret = pthread_mutex_lock(&osd_mutex);
+        assert(!ret);
+        ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
+        assert(ret>0);
+
+        drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
+
+        ret = pthread_mutex_unlock(&osd_mutex);
+        assert(!ret);
+
+        if (enable_osd && fb_id != 0) {
+            osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
+            uint64_t decode_and_handover_display_ms = get_time_ms() - decoding_pts;
+            osd_publish_uint_fact("video.decode_and_handover_ms", NULL, 0, decode_and_handover_display_ms);
+            if (update_osd_video_size) {
+                osd_publish_uint_fact("video.width", NULL, 0, output_list->video_frm_width);
+                osd_publish_uint_fact("video.height", NULL, 0, output_list->video_frm_height);
+                update_osd_video_size = false;
+            }
+        }
 	}
 end:	
 	spdlog::info("Display thread done");
@@ -668,16 +697,25 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
 	setup_mpi(packet);
 	
 	codec_detected.store(true);
+	last_demux_output_ms.store(0);
 
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
 	auto cb=[&packet, &rtp_receiver, /*&decoder_stalled_count,*/ &bytes_received, &period_start](void *data, int size, bool is_codec_changed){
+		uint64_t now = get_time_ms();
+		last_demux_output_ms.store(now);
+
+        if (!video_present.load()) {
+            spdlog::info("Video stream detected");
+            video_present.store(true);
+        }
+
 		if (is_codec_changed)
 		{
 			codec_changed.store(true);
 		}
 		bytes_received += size;
-		uint64_t now = get_time_ms();
+		
 		osd_publish_uint_fact("rtp.received_bytes", NULL, 0, size);
         feed_packet_to_decoder(packet, data, size);
         if (dvr_enabled && dvr != NULL && codec == VideoCodec::H265) {
@@ -687,27 +725,49 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
         }
     };
 	rtp_receiver->start_receiving(cb);
+
 	// TODO: DVR Recording allowed only for H265 due unclear bug in librtp we receive corrupted data for H264 codec and due to that dvr can't write data correctly
 	if (dvr_autostart && dvr != NULL && codec == VideoCodec::H265) {
 		dvr->start_recording();
 	}
 
-    while (!signal_flag){
-		if (codec_changed.load())
-		{
-			rtp_receiver->stop_receiving();
-			mpp_packet_set_eos(packet);
-			mpp_packet_set_length(packet, 0);
-			int ret=0;
-			while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
-				usleep(10000);
-			}
-			restart_mpi(packet, rtp_receiver->get_video_codec());
-			rtp_receiver->start_receiving(cb);
-		}
-		else {
-	        sleep(10);
-		}
+    while (!signal_flag) {
+		if (codec_changed.load()) {
+            rtp_receiver->stop_receiving();
+
+            mpp_packet_set_eos(packet);
+            mpp_packet_set_length(packet, 0);
+
+            int ret = 0;
+            while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
+                usleep(10000);
+            }
+
+            restart_mpi(packet, rtp_receiver->get_video_codec());
+
+            last_demux_output_ms.store(0);
+            video_present.store(false);
+            update_osd_video_size = true;
+
+            rtp_receiver->start_receiving(cb);
+        } else {
+            uint64_t now = get_time_ms();
+            uint64_t last = last_demux_output_ms.load();
+
+            bool has_video = (last != 0) && ((now - last) <= NO_VIDEO_TIMEOUT_MS);
+
+            if (!has_video) {
+                if (video_present.load()) {
+                    spdlog::info("Video stream lost (no packets for {} sec)", NO_VIDEO_TIMEOUT_MS / 1000);
+                    video_present.store(false);
+                    update_osd_video_size = true;
+
+                    clear_video_runtime_facts();
+                    clear_osd_wfbcli();
+                }
+            }
+            sleep(1);
+        }
     }
 	rtp_receiver->stop_receiving();
     spdlog::info("Feeding eos");
@@ -766,14 +826,16 @@ void printHelp() {
     "\n"
 	"    --target-frame-rate <fps> - Target DRM refresh rate for mode selection (30..120), ex: 60\n"
 	"                                Makes DRM choose the highest available resolution at the requested FPS\n"
-	"                                For optimal smoothness, use a value equal to or divisible by the video FPS.\n"
+	"                                For optimal smoothness, use a value equal to or divisible by the video FPS\n"
     "\n"
 	"    --disable-vsync           - Disable VSYNC commits\n"
 	"\n"
-    "    --screen-mode-list        - Print the list of supported screen modes and exit.\n"
+    "    --screen-mode-list        - Print the list of supported screen modes and exit\n"
     "\n"
     "    --wfb-api-port            - Port of wfb-server for cli statistics. (Default: 8003)\n"
 	"                                Use \"0\" to disable this stats\n"
+    "\n"
+	"    --screensaver-image       - Path to a PNG image to display on the screensaver\n"
     "\n"
     "    --version                 - Show program version\n"
     "\n", APP_VERSION_MAJOR, APP_VERSION_MINOR
@@ -791,7 +853,7 @@ int main(int argc, char **argv)
 {
 	int ret;	
 	int i, j;
-	int mavlink_thread = 0;
+	bool mavlink_thread = false;
 	int print_modelist = 0;
 	char* dvr_template = NULL;
 	int video_framerate = -1;
@@ -805,6 +867,7 @@ int main(int argc, char **argv)
 	uint32_t mode_vrefresh = 0;
 	uint32_t target_frame_rate = 0;
 	std::string osd_config_path;
+    std::string screensaver_image_path;
 	auto log_level = spdlog::level::info;
 	
     std::string pidFilePath = "/run/pixelpilot.pid";
@@ -915,8 +978,8 @@ int main(int argc, char **argv)
         	break;
 
     	case OPT_OSD: // --osd
-        	enable_osd = 1;
-        	mavlink_thread = 1;
+            enable_osd = true;
+            mavlink_thread = true;
         	break;
 
     	case OPT_OSD_CONFIG: // --osd-config
@@ -992,7 +1055,18 @@ int main(int argc, char **argv)
         	break;
     	}
 
-    	case OPT_VERSION: // --version
+        case OPT_SCREENSAVER_IMG: { // --screensaver-image
+            std::string image_path = std::string(optarg);
+            if (!std::filesystem::exists(image_path)){
+                spdlog::error("--screensaver-image: invalid path to image '{}'", optarg);
+                printHelp();
+                return -1;
+            }
+            screensaver_image_path = image_path;
+            break;
+        }
+
+        case OPT_VERSION: // --version
         	printVersion();
         	return 0;
 
@@ -1012,10 +1086,6 @@ int main(int argc, char **argv)
 
 	printVersion();
 	spdlog::info("disable_vsync: {}", disable_vsync);
-
-	if (enable_osd == 0 ) {
-		video_zpos = 4;
-	}
 
     ////////////////////////////////////////////// DRM SETUP
 
@@ -1065,32 +1135,31 @@ int main(int argc, char **argv)
 	assert(!ret);
 	ret = pthread_create(&tid_display, NULL, __DISPLAY_THREAD__, NULL);
 	assert(!ret);
-	if (enable_osd) {
-		nlohmann::json osd_config;
-		if(osd_config_path != "") {
-			std::ifstream f(osd_config_path);
-			osd_config = nlohmann::json::parse(f);
-		} else {
-			osd_config = {};
-		}
-		if (mavlink_thread) {
-			ret = pthread_create(&tid_mavlink, NULL, __MAVLINK_THREAD__, &signal_flag);
-			assert(!ret);
-		}
-		if (wfb_port) {
-			wfb_thread_params *wfb_args = (wfb_thread_params *)malloc(sizeof *wfb_args);
-			wfb_args->port = wfb_port;
-			ret = pthread_create(&tid_wfbcli, NULL, __WFB_CLI_THREAD__, wfb_args);
-			assert(!ret);
-		}
 
-		osd_thread_params *args = (osd_thread_params *)malloc(sizeof *args);
-        args->fd = drm_fd;
-        args->out = output_list;
-		args->config = osd_config;
-		ret = pthread_create(&tid_osd, NULL, __OSD_THREAD__, args);
-		assert(!ret);
-	}
+    nlohmann::json osd_config{};
+    if (enable_osd) {
+        if(osd_config_path != "") {
+            std::ifstream f(osd_config_path);
+            osd_config = nlohmann::json::parse(f);
+        }
+        if (mavlink_thread) {
+            ret = pthread_create(&tid_mavlink, NULL, __MAVLINK_THREAD__, &signal_flag);
+            assert(!ret);
+        }
+        if (wfb_port) {
+            wfb_thread_params *wfb_args = (wfb_thread_params *)malloc(sizeof *wfb_args);
+            wfb_args->port = wfb_port;
+            ret = pthread_create(&tid_wfbcli, NULL, __WFB_CLI_THREAD__, wfb_args);
+            assert(!ret);
+        }
+    }
+    osd_thread_params *args = new osd_thread_params;
+    args->fd = drm_fd;
+    args->out = output_list;
+    args->config = osd_config;
+    args->screensaver_image = screensaver_image_path;
+    ret = pthread_create(&tid_osd, NULL, __OSD_THREAD__, args);
+    assert(!ret);
 
 	////////////////////////////////////////////// MAIN LOOP
 
@@ -1116,17 +1185,19 @@ int main(int argc, char **argv)
 	ret = pthread_mutex_destroy(&video_mutex);
 	assert(!ret);
 
-	if (mavlink_thread) {
-		ret = pthread_join(tid_mavlink, NULL);
-		assert(!ret);
-	}
-	if (enable_osd) {
-		ret = pthread_join(tid_wfbcli, NULL);
-		assert(!ret);
-		ret = pthread_join(tid_osd, NULL);
-		assert(!ret);
-	}
-	if (dvr_template != NULL ){
+    if (enable_osd) {
+        if (mavlink_thread) {
+            ret = pthread_join(tid_mavlink, NULL);
+            assert(!ret);
+        }
+        ret = pthread_join(tid_wfbcli, NULL);
+        assert(!ret);
+    }
+
+    ret = pthread_join(tid_osd, NULL);
+    assert(!ret);
+
+    if (dvr_template != NULL ) {
 		ret = pthread_join(tid_dvr, NULL);
 		assert(!ret);
 	}

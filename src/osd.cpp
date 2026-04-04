@@ -32,7 +32,7 @@ extern "C" {
 
 using json = nlohmann::json;
 
-int enable_osd = 0;
+bool enable_osd = false;
 int osd_zpos = 2;
 extern uint32_t refresh_frequency_ms;
 extern uint32_t frames_received;
@@ -45,6 +45,7 @@ u_int custom_msg_refresh_count = 0;
 extern pthread_mutex_t video_mutex;
 extern pthread_cond_t video_cond;
 bool osd_update_ready = false;
+extern std::atomic<bool> video_present;
 
 
 double getTimeInterval(struct timespec* timestamp, struct timespec* last_meansure_timestamp) {
@@ -116,6 +117,7 @@ public:
 	Fact(FactMeta meta, ulong val): meta(meta), value(val), type(T_UINT) {};
 	Fact(FactMeta meta, double val): meta(meta), value(val), type(T_DOUBLE) {};
 	Fact(FactMeta meta, std::string val): meta(meta), value(val), type(T_STRING) {};
+	Fact(FactMeta meta): meta(meta), type(T_UNDEF) {};
 
 	bool isDefined() {
 		return type != T_UNDEF;
@@ -508,7 +510,11 @@ public:
 	IconWidget(int pos_x, int pos_y, cairo_surface_t *icon):
 		Widget(pos_x, pos_y), icon(icon) {};
 
-	virtual void draw(cairo_t *cr) {
+    virtual ~IconWidget() {
+        cairo_surface_destroy(icon);
+    }
+
+    virtual void draw(cairo_t *cr) {
 		auto [x, y] = xy(cr);
 		drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
 	}
@@ -522,6 +528,10 @@ class IconTextWidget: public Widget {
 public:
 	IconTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string text):
 		Widget(pos_x, pos_y), text(text), icon(icon) {};
+
+    virtual ~IconTextWidget() {
+        cairo_surface_destroy(icon);
+    }
 
 	virtual void draw(cairo_t *cr) {
 		auto [x, y] = xy(cr);
@@ -565,9 +575,13 @@ protected:
 				at_placeholder = false;
 			} else if (at_placeholder) {
 				at_placeholder = false;
+				if (fact_i >= args.size()) {
+                	msg->push_back('-');
+                	continue;
+            	}
 				fact = &args[fact_i];
 				if (!fact->isDefined()) {
-					msg->push_back('?');
+					msg->push_back('-');
 					fact_i++;
 					continue;
 				}
@@ -602,7 +616,7 @@ protected:
 					}
 				default:
 					{
-						msg->push_back('?');
+						msg->push_back('-');
 					}
 				}
 				fact_i++;
@@ -621,6 +635,10 @@ class IconTplTextWidget: public TplTextWidget {
 public:
 	IconTplTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args):
 		TplTextWidget(pos_x, pos_y, tpl, num_args), icon(icon) {};
+
+    virtual ~IconTplTextWidget() {
+        cairo_surface_destroy(icon);
+    }
 
 	virtual void draw(cairo_t *cr) {
 		auto [x, y] = xy(cr);
@@ -878,72 +896,174 @@ public:
 	}
 };
 
+class IconTplStatusWidget : public IconTplTextWidget {
+public:
+    IconTplStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args) :
+        IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args) {}
+
+    void draw(cairo_t *cr) {
+        auto [x, y] = xy(cr);
+
+        std::vector<Fact> subargs;
+        for (size_t i = 1; i < args.size(); ++i) subargs.push_back(args[i]);
+        std::unique_ptr<std::string> msg = render_tpl(tpl, subargs);
+
+        if(args[0].isDefined() && args[0].getBoolValue()) {
+            drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
+            drawStrokeText(cr, x + 35, y, *msg, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 2.0);
+        } else {
+            drawStrokeIcon(cr, icon, x, y - 20, CairoColor{0.4, 0.4, 0.44, 1.0}, CairoColor{0.0, 0.0, 0.0, 0.4}, 1);
+            drawStrokeText(cr, x + 35, y, *msg, CairoColor{0.4, 0.4, 0.44, 1.0}, CairoColor{0.0, 0.0, 0.0, 0.4}, 2.0);
+        }
+    }
+};
 
 class VideoWidget: public IconTplTextWidget {
 public:
   VideoWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
-              cairo_surface_t *icon, std::string tpl, uint num_args) :
+              cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
 		IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
-		fps(window_size_ms, bucket_size_ms) {};
+        fps_(window_size_ms, bucket_size_ms)
+    {
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MAX_WIDGET_REFRESH_MS) {
+            spdlog::warn("VideoWidget: Refresh rate '{}' is out of range [{} {}].",
+                refresh_rate, refresh_frequency_ms, MAX_WIDGET_REFRESH_MS);
+            spdlog::warn("VideoWidget: Using osd refresh rate: {}", refresh_frequency_ms);
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
+        }
+        else {
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_rate);
+        }
+    }
 
 	virtual void setFact(uint idx, Fact fact) {
 		if (idx == 0) {
+
+            if (!fact.isDefined()) {
+                args[idx] = Fact();
+                return;
+            }
 			// replace the value with its increment rate per-second
 			ulong num_frames = fact.getUintValue(); // should be always '1'
-			fps.add(num_frames);
-			args[idx] = Fact(FactMeta("video_fps"), (ulong)fps.rate_per_second_over_last_ms(1000));
+            fps_.add(num_frames);
+
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = now - last_drawn_;
+            
+            if (elapsed < refresh_rate_ms_) {
+                return;
+            }
+            last_drawn_ = now;
+
+            args[idx] = Fact(FactMeta("video_fps"), (ulong)fps_.rate_per_second_over_last_ms(1000));
 		} else {
 			args[idx] = fact;
 		}
 	}
 
 private:
-	RunningAverage fps;
+    RunningAverage fps_;
+    std::chrono::milliseconds refresh_rate_ms_{};
+    std::chrono::steady_clock::time_point last_drawn_{};
 };
 
 class VideoBitrateWidget: public IconTplTextWidget {
 public:
   VideoBitrateWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
-					 cairo_surface_t *icon, std::string tpl, uint num_args) :
-		IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
-		bps(window_size_ms, bucket_size_ms) {
-	  assert(num_args == 1);
-  };
+                     cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
+        IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
+        bps_(window_size_ms, bucket_size_ms)
+    {
+        assert(num_args == 1);
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MAX_WIDGET_REFRESH_MS) {
+            spdlog::warn("VideoBitrateWidget: Refresh rate '{}' is out of range [{} {}].",
+                refresh_rate, refresh_frequency_ms, MAX_WIDGET_REFRESH_MS);
+            spdlog::warn("VideoBitrateWidget: Using osd refresh rate: {}", refresh_frequency_ms);
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
+        }
+        else {
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_rate);
+        }
+    }
 
 	virtual void setFact(uint idx, Fact fact) {
 		assert(idx == 0);
+
+        if (!fact.isDefined()) {
+            args[idx] = Fact();
+            return;
+        }
 		// replace the value with its increment rate per-second
 		ulong num_bytes = fact.getUintValue();
-		bps.add(num_bytes);
-		// 125000 is 1_000_000 / 8 (megabits, not megabytes)
-		args[idx] = Fact(FactMeta("video_mbps"), bps.rate_per_second_over_last_ms(1000) / 125000.0);
-	}
+        bps_.add(num_bytes);
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = now - last_drawn_;
+            
+        if (elapsed < refresh_rate_ms_) {
+            return;
+        }
+        last_drawn_ = now;
+
+        // 125000 is 1_000_000 / 8 (megabits, not megabytes)
+        args[idx] = Fact(FactMeta("video_mbps"), bps_.rate_per_second_over_last_ms(1000) / 125000.0);
+    }
 
 private:
-	RunningAverage bps;
+    RunningAverage bps_;
+    std::chrono::milliseconds refresh_rate_ms_{};
+    std::chrono::steady_clock::time_point last_drawn_{};
 };
 
 class VideoDecodeLatencyWidget: public IconTplTextWidget {
 public:
   VideoDecodeLatencyWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
-					 cairo_surface_t *icon, std::string tpl, uint num_args) :
-		IconTplTextWidget(pos_x, pos_y, icon, tpl, 3),  // 3 args, because we calculate min/max/avg
-		timing(window_size_ms, bucket_size_ms) {
-	  assert(num_args == 1);
-  };
+                           cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
+        IconTplTextWidget(pos_x, pos_y, icon, tpl, 3),  // 3 args, because we calculate min/max/avg
+        timing_(window_size_ms, bucket_size_ms)
+    {
+        assert(num_args == 1);
+        if (refresh_rate < refresh_frequency_ms || refresh_rate > MAX_WIDGET_REFRESH_MS) {
+            spdlog::warn("VideoDecodeLatencyWidget: Refresh rate '{}' is out of range [{} {}].",
+                refresh_rate, refresh_frequency_ms, MAX_WIDGET_REFRESH_MS);
+            spdlog::warn("VideoDecodeLatencyWidget: Using osd refresh rate: {}", refresh_frequency_ms);
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_frequency_ms);
+        }
+        else {
+            refresh_rate_ms_ = std::chrono::milliseconds(refresh_rate);
+        }
+    }
 
 	virtual void setFact(uint idx, Fact fact) {
 		assert(idx == 0);
+
+		if (!fact.isDefined()) {
+        	args[0] = Fact();
+        	args[1] = Fact();
+        	args[2] = Fact();
+        	return;
+    	}
 		ulong decode_time = fact.getUintValue();
-		timing.add(decode_time);
-		Stats stats = timing.get_stats_over_last_ms_result(1000);
+        timing_.add(decode_time);
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = now - last_drawn_;
+            
+        if (elapsed < refresh_rate_ms_) {
+            return;
+        }
+        last_drawn_ = now;
+
+        Stats stats = timing_.get_stats_over_last_ms_result(1000);
 		args[0] = Fact(FactMeta("video_avg"), stats.average);
 		args[1] = Fact(FactMeta("video_min"), stats.min);
 		args[2] = Fact(FactMeta("video_max"), stats.max);
 	}
 
 private:
-	RunningAverage timing;
+    RunningAverage timing_;
+    std::chrono::milliseconds refresh_rate_ms_{};
+    std::chrono::steady_clock::time_point last_drawn_{};
 };
 
 
@@ -1029,15 +1149,18 @@ class ExternalSurfaceWidget: public Widget {
 public:
 	ExternalSurfaceWidget(int pos_x, int pos_y, std::string shm_name ): Widget(pos_x, pos_y), shm_name(shm_name)  {};
 
-	virtual void init_shm(cairo_t *cr) {
+	void init_shm(cairo_t *cr) {
 		SPDLOG_INFO("Creating shm region {}", shm_name);
 
 		cairo_surface_t *target = cairo_get_target(cr);
 		int width = cairo_image_surface_get_width(target);
 		int height = cairo_image_surface_get_height(target);
 
+        const uint32_t stride   = static_cast<uint32_t>(width * 4); // ARGB32
+		const size_t   buf_size = static_cast<size_t>(stride) * height;
+
 		// Calculate total shared memory size
-		shm_size = sizeof(SharedMemoryRegion) + (width * height * 4); // Metadata + Image data
+		shm_size = sizeof(SharedMemoryRegion) + (buf_size * SHM_BUFFERS_COUNT); // Metadata + 3 buffers for Image data
 
 		// Create shared memory region
 		int shm_fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
@@ -1049,47 +1172,83 @@ public:
 		if (ftruncate(shm_fd, shm_size) == -1) {
 			perror("Failed to set shared memory size");
 			shm_unlink(shm_name.c_str());
+            close(shm_fd);
 			return;
 		}
 
 		// Map shared memory to process address space
-		auto *shm_region = static_cast<SharedMemoryRegion*>(
+		shm_region = static_cast<SharedMemoryRegion*>(
 			mmap(0, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0)
 		);
 		if (shm_region == MAP_FAILED) {
 			perror("Failed to map shared memory");
 			shm_unlink(shm_name.c_str());
+            close(shm_fd);
 			return;
 		}
+
+        close(shm_fd);
 
 		// Write metadata
 		shm_region->width = width;
 		shm_region->height = height;
+        shm_region->stride = stride;
+        shm_region->refresh_rate = refresh_frequency_ms;
+        shm_region->ready_index.store(-1);
+        shm_region->front_index.store(0);
+        shm_region->back_index.store(1);
 
-		// Create Cairo surface for the image data
-		shm_surface = cairo_image_surface_create_for_data(
-			shm_region->data, CAIRO_FORMAT_ARGB32, width, height, width * 4
-		);
+        unsigned char *base = shm_region->data;
 
+        for (int i = 0; i < SHM_BUFFERS_COUNT; ++i) {
+            unsigned char *buf_ptr = base + (i * buf_size);
+
+            // Create Cairo surface for the image data
+            cairo_surface_t *surf = cairo_image_surface_create_for_data(
+                buf_ptr, CAIRO_FORMAT_ARGB32, width, height, stride);
+
+            if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) {
+                spdlog::error("Failed to create cairo surface for buffer {}", i);
+                cairo_surface_destroy(surf);
+                shm_surfaces[i] = nullptr;
+            } else {
+                shm_surfaces[i] = surf;
+            }
+
+        }
 		// Store pointer for cleanup
 		shm_data = reinterpret_cast<unsigned char*>(shm_region);
 	}
 
-
 	virtual void draw(cairo_t *cr) {
+        if (!shm_region) {
+            init_shm(cr);
+        }
+        if (!shm_region) {
+            return;
+        }
 
-		if (! shm_surface) 
-			init_shm(cr);
-		auto [x, y] = xy(cr);
-		cairo_set_source_surface(cr, shm_surface, x, y); // Position at (0, 0)
-    	cairo_paint(cr); // Paint shm_surface onto base_surface
-	}
+		int ready = shm_region->ready_index.exchange(-1);
+		if (ready >= 0 && ready < SHM_BUFFERS_COUNT) {
+			last_surface_index = ready;
+			shm_region->front_index.store(ready);
+        }
+		if (last_surface_index != -1) {
+			auto [x, y] = xy(cr);
+        	cairo_set_source_surface(cr, shm_surfaces[last_surface_index], x, y); // Position at (0, 0)
+        	cairo_paint(cr); // Paint shm_surface onto base_surface
+		} 
+    }
 
-	~ExternalSurfaceWidget() {
+    virtual ~ExternalSurfaceWidget() {
 		SPDLOG_INFO("Destroying shm region {}", shm_name);
-		if (shm_surface) {
-			cairo_surface_destroy(shm_surface);
-		}
+
+        for (int i = 0; i < SHM_BUFFERS_COUNT; ++i) {
+            if (shm_surfaces[i]) {
+                cairo_surface_destroy(shm_surfaces[i]);
+                shm_surfaces[i] = nullptr;
+            }
+        }
 		if (shm_data) {
 			munmap(shm_data, shm_size);
 		}
@@ -1097,9 +1256,11 @@ public:
 	}
 
 protected:
-	cairo_surface_t *shm_surface = nullptr;
-	unsigned char *shm_data = nullptr;
-	size_t shm_size;
+	SharedMemoryRegion *shm_region = nullptr;
+	int32_t last_surface_index = -1;
+	cairo_surface_t *shm_surfaces[SHM_BUFFERS_COUNT] = {nullptr, nullptr, nullptr};
+	size_t shm_size = 0;
+    unsigned char *shm_data = nullptr;
 	std::string shm_name;
 };
 
@@ -1200,6 +1361,12 @@ private:
 
 class Osd {
 public:
+    ~Osd() {
+        if (screensaver_image) {
+            cairo_surface_destroy(screensaver_image);
+        }
+    }
+
 	void loadConfig(json cfg) {
 		json obj;
 		if (!cfg.contains("format")) {
@@ -1211,14 +1378,14 @@ public:
 			spdlog::error("OSD config doesn't have 'widgets' key");
 			return;
 		}
-		std::filesystem::path assets_dir(".");
+        std::filesystem::path assets_dir{"."};
 		if (cfg.contains("assets_dir")) {
 			assets_dir = cfg.at("assets_dir").template get<std::filesystem::path>();
 		}
 		json widgets_j = cfg.at("widgets");
 		for (json widget_j : widgets_j) {
-			if(!(widget_j.contains("name") || widget_j.contains("type") || widget_j.contains("x") ||
-				 widget_j.contains("y") || widget_j.contains("facts"))) {
+			if(!widget_j.contains("name") || !widget_j.contains("type") || !widget_j.contains("x") ||
+				!widget_j.contains("y") || !widget_j.contains("facts")) {
 				spdlog::error("Missing required key name/type/x/y/facts");
 				return;
 			}
@@ -1272,35 +1439,44 @@ public:
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new IconStatusWidget(x, y, icon), matchers);
+			} else if (type == "IconTplStatusWidget") {
+    			auto tpl = widget_j.at("template").template get<std::string>();
+    			auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
+    			cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
+    			if (icon == NULL) break;
+    			addWidget(new IconTplStatusWidget(x, y, icon, tpl, (uint)matchers.size()), matchers);
 			} else if(type == "VideoWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
-				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
+                uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoWidget(x, y, window_size_s * 1000, bucket_size_ms,
-										  icon, tpl, (uint)matchers.size()),
+                                          icon, tpl, refresh_rate_ms, (uint)matchers.size()),
 						  matchers);
 			} else if(type == "VideoBitrateWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
-				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
+                uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoBitrateWidget(x, y, window_size_s * 1000, bucket_size_ms,
-												 icon, tpl, (uint)matchers.size()),
+                                                 icon, tpl, refresh_rate_ms, (uint)matchers.size()),
 						  matchers);
 			} else if(type == "VideoDecodeLatencyWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				uint window_size_s = widget_j.at("per_second_window_s").template get<uint>();
-				uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();;
+                uint bucket_size_ms = widget_j.at("per_second_bucket_ms").template get<uint>();
+                uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new VideoDecodeLatencyWidget(x, y, window_size_s * 1000, bucket_size_ms,
-													   icon, tpl, 1),
+                                                       icon, tpl, refresh_rate_ms, 1),
 						  matchers);
 			} else if(type == "BoxWidget") {
 				auto width = widget_j.at("width").template get<uint>();
@@ -1371,6 +1547,20 @@ public:
 		}
 	};
 
+    void loadScreensaverImage(std::string image_path)  {
+
+        cairo_surface_t *image = cairo_image_surface_create_from_png(image_path.c_str());
+        if (cairo_surface_status(image) != CAIRO_STATUS_SUCCESS) {
+            spdlog::error("Can't open icon '{}' for screensaver", image_path);
+            return;
+        }
+        screensaver_image = image;
+    }
+
+    cairo_surface_t * getScreensaverImage() const {
+        return screensaver_image;
+    }
+
 private:
 
 	cairo_surface_t *openIcon(std::string widget_name, std::filesystem::path base_path,
@@ -1410,8 +1600,29 @@ private:
 
 	std::vector<Widget *> widgets;
 	std::vector<std::tuple<FactMatcher, Widget *, uint>> matchers;
+    cairo_surface_t * screensaver_image = nullptr;
 };
 
+void show_screensaver(cairo_t* cr, int width, int height, cairo_surface_t * screensaver_image) {
+    // draw background
+    cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0); // black color
+    cairo_rectangle(cr, 0, 0, width, height);
+    cairo_fill(cr);
+
+    if (screensaver_image) {
+        int image_width = cairo_image_surface_get_width(screensaver_image);
+        int image_height = cairo_image_surface_get_height(screensaver_image);
+
+        if (image_width > width || image_height > height) {
+			spdlog::error("Icon {} x {} larger than screen {} x {}",
+              			  image_width, image_height, width, height);
+            return;
+        }
+        // draw image at center of the screen
+        cairo_set_source_surface(cr, screensaver_image, (width - image_width) / 2, (height - image_height) / 2);
+        cairo_paint(cr);
+    }
+}
 
 std::queue<Fact> fact_queue;
 std::mutex mtx;
@@ -1426,8 +1637,7 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 	memset(msg, 0x00, sizeof(msg));
 
 	//check custom message
-	//TODO: move this code to the main thread's main loop (read_gstreamerpipe_stream, sleep(10))
-	if (osd_custom_message) {
+	if (enable_osd && osd_custom_message) {
 		std::string filename = "/run/pixelpilot.msg";
 		FILE *file = fopen(filename.c_str(), "r");
 		osd_tag tag;
@@ -1466,10 +1676,16 @@ void modeset_paint_buffer(struct modeset_buf *buf, Osd *osd) {
 	cairo_paint(cr);
 	cairo_restore(cr);
 
-	cairo_select_font_face (cr, "Roboto", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-	cairo_set_font_size (cr, 20);
+	cairo_select_font_face(cr, "Roboto", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+	cairo_set_font_size(cr, 20);
 
-	osd->draw(cr);
+    if (!video_present.load())
+    {
+        show_screensaver(cr, buf->width, buf->height, osd->getScreensaverImage());
+    }
+    if (enable_osd) {
+        osd->draw(cr);
+    }
 
 	cairo_fill(cr);
 	cairo_destroy(cr);
@@ -1499,7 +1715,10 @@ void *__OSD_THREAD__(void *param) {
 	Osd *osd = new Osd;
 	pthread_setname_np(pthread_self(), "__OSD");
 
-	osd->loadConfig(p->config);
+    osd->loadScreensaverImage(p->screensaver_image);
+    if (!p->config.empty()) {
+	    osd->loadConfig(p->config);
+    }
 	auto last_display_at = std::chrono::steady_clock::now();
 
 	int ret = pthread_mutex_init(&osd_mutex, NULL);
@@ -1514,12 +1733,18 @@ void *__OSD_THREAD__(void *param) {
 		std::vector<Fact> fact_buf;
 		auto since_last_display = std::chrono::steady_clock::now() - last_display_at;
 		auto wait = std::chrono::milliseconds(refresh_frequency_ms) - since_last_display;
-		bool got_fact = cv.wait_for(
+		bool got_fact{false};
+
+        if (enable_osd) {
+            got_fact = cv.wait_for(
 					lock,
 					wait,
 					[/*fact_queue*/] {
 						return !fact_queue.empty();
 					});
+        } else {
+            sleep(1);
+        }
 		if (got_fact) {
 			// thread woke up because we got a new fact(s)
 			// copy all the facts to the temporary buffer to unlock the queue ASAP
@@ -1641,6 +1866,13 @@ void osd_add_str_fact(void *batch, char const *name, osd_tag *tags, int n_tags, 
 	facts->push_back(Fact(FactMeta(std::string(name), fact_tags), std::string(value)));
 };
 
+void osd_add_clear_fact(void *batch, char const *name, osd_tag *tags, int n_tags) {
+	std::vector<Fact> *facts = static_cast<std::vector<Fact> *>(batch);
+	FactTags fact_tags;
+	mk_tags(tags, n_tags, &fact_tags);
+	facts->push_back(Fact(FactMeta(std::string(name), fact_tags)));
+}
+
 
 // Individual APIs
 
@@ -1673,6 +1905,12 @@ void osd_publish_str_fact(char const *name, osd_tag *tags, int n_tags, const cha
 	mk_tags(tags, n_tags, &fact_tags);
 	publish(Fact(FactMeta(std::string(name), fact_tags), std::string(value)));
 };
+
+void osd_clear_fact(char const *name, osd_tag *tags, int n_tags) {
+	FactTags fact_tags;
+	mk_tags(tags, n_tags, &fact_tags);
+	publish(Fact(FactMeta(std::string(name), fact_tags)));
+}
 
 #ifdef __cplusplus
 }
