@@ -1234,6 +1234,7 @@ public:
 			shm_region->front_index.store(ready);
         }
 		if (last_surface_index != -1) {
+			cairo_surface_mark_dirty(shm_surfaces[last_surface_index]);
 			auto [x, y] = xy(cr);
         	cairo_set_source_surface(cr, shm_surfaces[last_surface_index], x, y); // Position at (0, 0)
         	cairo_paint(cr); // Paint shm_surface onto base_surface
@@ -1605,6 +1606,7 @@ private:
 
 void show_screensaver(cairo_t* cr, int width, int height, cairo_surface_t * screensaver_image) {
     // draw background
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
     cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0); // black color
     cairo_rectangle(cr, 0, 0, width, height);
     cairo_fill(cr);
@@ -1618,10 +1620,14 @@ void show_screensaver(cairo_t* cr, int width, int height, cairo_surface_t * scre
               			  image_width, image_height, width, height);
             return;
         }
-        // draw image at center of the screen
-        cairo_set_source_surface(cr, screensaver_image, (width - image_width) / 2, (height - image_height) / 2);
-        cairo_paint(cr);
+        int x = (width - image_width) / 2;
+        int y = (height - image_height) / 2;
+
+        cairo_set_source_surface(cr, screensaver_image, x, y);
+        cairo_rectangle(cr, x, y, image_width, image_height);
+        cairo_fill(cr);
     }
+	cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 }
 
 std::queue<Fact> fact_queue;
