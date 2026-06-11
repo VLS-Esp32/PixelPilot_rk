@@ -116,6 +116,10 @@ typedef boxsize_t MP4D_file_offset_t;
 #define HEVC_NAL_VPS 32
 #define HEVC_NAL_SPS 33
 #define HEVC_NAL_PPS 34
+#define AUD_NUT 35  // AUD_NUT  - access unit delimiter, nothing to mux
+#define PREFIX_SEI_NUT 39  // PREFIX_SEI_NUT - SEI inserted by encoder (e.g. timing, buffering period)
+#define SUFFIX_SEI_NUT 40  // SUFFIX_SEI_NUT
+
 #define HEVC_NAL_BLA_W_LP 16
 #define HEVC_NAL_CRA_NUT  21
 
@@ -2295,6 +2299,10 @@ static int mp4_h265_write_nal(mp4_h26x_writer_t *h, const unsigned char *nal, in
     case HEVC_NAL_PPS:
         MP4E_set_pps(h->mux, h->mux_track_id, nal, sizeof_nal);
         h->need_pps = 0;
+        break;
+    case AUD_NUT:
+    case PREFIX_SEI_NUT:
+    case SUFFIX_SEI_NUT:
         break;
     default:
         if (h->need_vps || h->need_sps || h->need_pps || h->need_idr)

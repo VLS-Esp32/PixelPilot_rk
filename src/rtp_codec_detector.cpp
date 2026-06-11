@@ -15,6 +15,8 @@
 #include "rtp-demuxer.h"
 #include "common.h"
 
+extern int signal_flag;
+
 static VideoCodec detect_rtp_codec(const uint8_t* payload, int payload_len)
 {
     if (!payload || payload_len < 64)
@@ -131,8 +133,7 @@ VideoCodec RtpCodecDecoder::detect_codec(int socket_fd)
         return VideoCodec::UNKNOWN;
     }
 
-    // Wait until codec is detected (single-thread, blocking)
-    while (m_running->load() && detected_codec == VideoCodec::UNKNOWN) {
+    while (m_running->load() && !signal_flag && detected_codec == VideoCodec::UNKNOWN) {
         int ret = poll(fds, 1, 5000);
         if (ret < 0) { if (errno == EINTR) continue; perror("poll"); break; }
         if (ret == 0) continue;

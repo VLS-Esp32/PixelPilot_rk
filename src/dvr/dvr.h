@@ -1,0 +1,68 @@
+#ifndef DVR_H
+#define DVR_H
+
+#include <queue>
+#include <mutex>
+#include <string>
+#include <condition_variable>
+
+#include "dvr_common.h"
+#include "mpp_encoder.h"
+#include "osd_compositor.h"
+#include "mp4_writer.h"
+
+class Dvr {
+public:
+    explicit Dvr(dvr_thread_params params);
+    virtual ~Dvr();
+
+    void frame(dvr_frame_info info);
+    void set_video_params(uint32_t video_frm_width, uint32_t video_frm_height);
+    void start_recording();
+    void stop_recording();
+    void toggle_recording();
+    void shutdown();
+
+    static void *__THREAD__(void *context);
+private:
+    void enqueue_dvr_command(dvr_rpc rpc);
+
+    void loop();
+    int  start();
+    void stop();
+    void init();
+    std::string generate_filename();
+    int  next_frame_duration();
+    MppBuffer import_decoder_buffer(const dvr_frame_info &info);
+    void encode_and_write(dvr_frame_info info);
+
+    std::queue<dvr_rpc> dvrQueue;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+    char *filename_template;
+    int  mp4_fragmentation_mode = 0;
+    bool dvr_filenames_with_sequence = false;
+    int  dvr_framerate = -1;
+    int  dvr_bitrate = 8000000;
+    RecordingMode mode = RecordingMode::VideoOnly;
+
+    uint32_t video_frm_width = 0;
+    uint32_t video_frm_height = 0;
+    uint32_t disp_width = 0;   // encoder output: display res, or video native if no display
+    uint32_t disp_height = 0;
+
+    int _ready_to_write = 0;
+
+    MppEncoder    encoder;
+    OsdCompositor osd;
+    Mp4Writer     writer;
+
+    uint32_t frames_submitted = 0;
+    uint32_t frames_written   = 0;
+    int64_t  last_fwd_pts = -1;          // PTS (ms) of last frame forwarded, for fps matching
+    std::queue<int64_t> submitted_pts;   // FIFO of submitted frame PTS (ms), in encode order
+    int64_t  last_written_pts = -1;      // PTS (ms) of last frame written to the MP4
+};
+
+#endif

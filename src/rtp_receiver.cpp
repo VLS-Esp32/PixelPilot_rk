@@ -20,6 +20,9 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <iostream>
+
+extern int signal_flag;
+
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
@@ -125,6 +128,11 @@ void RtpReceiver::init()
         m_running->store(true);
         m_video_codec = m_codec_detector->detect_codec(m_socket_handler->get_socket_fd());
         if (m_video_codec == VideoCodec::UNKNOWN) {
+            if (signal_flag) {
+                spdlog::info("[ RTP ] Codec detection aborted (shutdown requested)");
+                m_running->store(false);
+                return;
+            }
             spdlog::error("[ RTP ] Failed to detect codec");
             assert(false);
         }

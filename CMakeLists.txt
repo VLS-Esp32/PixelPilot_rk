@@ -18,8 +18,15 @@ set(SOURCE_FILES
         src/rtp_codec_detector.cpp
         src/rtp_receiver.hpp
         src/rtp_receiver.cpp
-        src/dvr.h
-        src/dvr.cpp
+        src/dvr/dvr_common.h
+        src/dvr/mpp_encoder.h
+        src/dvr/mpp_encoder.cpp
+        src/dvr/osd_compositor.h
+        src/dvr/osd_compositor.cpp
+        src/dvr/mp4_writer.h
+        src/dvr/mp4_writer.cpp
+        src/dvr/dvr.h
+        src/dvr/dvr.cpp
         src/mavlink.h
         src/mavlink.c
         src/main.cpp

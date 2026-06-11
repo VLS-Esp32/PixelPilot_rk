@@ -45,7 +45,7 @@ extern "C" {
 #include "osd.h"
 #include "osd.hpp"
 #include "wfbcli.hpp"
-#include "dvr.h"
+#include "dvr/dvr.h"
 #include "scheduling_helper.hpp"
 #include "time_util.h"
 #include "pixelpilot_config.h"
@@ -85,6 +85,8 @@ enum AppOption {
     OPT_DVR_SEQUENCED_FILES,
     OPT_DVR_FRAMERATE,
     OPT_DVR_FMP4,
+    OPT_DVR_OSD,
+    OPT_DVR_BITRATE,
     OPT_LOG_LEVEL,
     OPT_MAVLINK_PORT,
     OPT_MAVLINK_DVR_ON_ARM,
@@ -112,6 +114,8 @@ static const struct option pixelpilot_long_options[] = {
     {"dvr-sequenced-files", no_argument,       0, OPT_DVR_SEQUENCED_FILES},
     {"dvr-framerate",       required_argument, 0, OPT_DVR_FRAMERATE},
     {"dvr-fmp4",            no_argument,       0, OPT_DVR_FMP4},
+    {"dvr-osd",             no_argument,       0, OPT_DVR_OSD},
+    {"dvr-bitrate",         required_argument, 0, OPT_DVR_BITRATE},
     {"log-level",           required_argument, 0, OPT_LOG_LEVEL},
     {"mavlink-port",        required_argument, 0, OPT_MAVLINK_PORT},
     {"mavlink-dvr-on-arm",  no_argument,       0, OPT_MAVLINK_DVR_ON_ARM},
@@ -156,6 +160,7 @@ pthread_t tid_frame;
 VideoCodec codec = VideoCodec::H265;
 Dvr *dvr = NULL;
 int dvr_autostart = 0;
+int signal_flag = 0;
 
 void init_buffer(MppFrame frame) {
 	output_list->video_frm_width = mpp_frame_get_width(frame);
@@ -269,7 +274,7 @@ void init_buffer(MppFrame frame) {
 
 	// dvr setup
 	if (dvr != NULL){
-		dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height, codec);
+        dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height);
 	}
 }
 
@@ -300,7 +305,7 @@ void *__FRAME_THREAD__(void *param)
 	uint64_t last_frame_time;
 	pthread_setname_np(pthread_self(), "__FRAME");
 
-	while (!frm_eos) {
+    while (!frm_eos && !signal_flag) {
 		struct timespec ts, ats;
 
 		// Skip frame till codec will no be detected
@@ -343,7 +348,7 @@ void *__FRAME_THREAD__(void *param)
 					assert(i!=MAX_FRAMES);
 
 					ts = ats;
-					
+
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
@@ -354,7 +359,20 @@ void *__FRAME_THREAD__(void *param)
 					assert(!ret);
 					ret = pthread_mutex_unlock(&video_mutex);
 					assert(!ret);
-					
+
+                    // send decoded frame to DVR for re-encoding
+                    if (dvr_enabled && dvr != NULL) {
+                        dvr_frame_info dfi;
+                        dfi.prime_fd   = mpi.frame_to_drm[i].prime_fd;
+                        dfi.width      = output_list->video_frm_width;
+                        dfi.height     = output_list->video_frm_height;
+                        dfi.hor_stride = mpp_frame_get_hor_stride(frame);
+                        dfi.ver_stride = mpp_frame_get_ver_stride(frame);
+                        dfi.buf_size   = dfi.hor_stride * dfi.ver_stride * 2;
+                        dfi.pts        = feed_data_ts;
+                        dvr->frame(dfi);
+                    }
+
 				}
 			}
 			
@@ -373,7 +391,7 @@ void *__DISPLAY_THREAD__(void *param)
 	int ret;	
 	pthread_setname_np(pthread_self(), "__DISPLAY");
 
-	while (!frm_eos) {
+    while (!frm_eos && !signal_flag) {
 		int fb_id;
 		bool osd_update;
 		
@@ -382,7 +400,7 @@ void *__DISPLAY_THREAD__(void *param)
 		while (output_list->video_fb_id==0 && !osd_update_ready) {
 			pthread_cond_wait(&video_cond, &video_mutex);
 			assert(!ret);
-			if (output_list->video_fb_id == 0 && frm_eos) {
+            if (output_list->video_fb_id == 0 && (frm_eos || signal_flag)) {
 				ret = pthread_mutex_unlock(&video_mutex);
 				assert(!ret);
 				goto end;
@@ -437,8 +455,6 @@ end:
 
 // signal
 
-int signal_flag = 0;
-
 void sig_handler(int signum)
 {
 	spdlog::info("Received signal {}", signum);
@@ -446,18 +462,12 @@ void sig_handler(int signum)
 	mavlink_thread_signal++;
 	wfb_thread_signal++;
 	osd_thread_signal++;
-	if (dvr != NULL) {
-		dvr->shutdown();
-	}
 }
 
 void sigusr1_handler(int signum) {
 	spdlog::info("Received signal {}", signum);
-	if (dvr && codec == VideoCodec::H265) {
+    if (dvr) {
 		dvr->toggle_recording();
-	}
-	else if (dvr && codec != VideoCodec::H265) {
-		spdlog::warn("Received signal {} DVR can not start recording due to unsupported codec {}", signum, codec_type_name(codec));
 	}
 }
 
@@ -585,6 +595,11 @@ void cleanup_mpi(MppPacket &packet)
 {
 	int i;
 
+    // setup_mpi may have been skipped (shutdown before the stream came up)
+    if (mpi.mpi == NULL) {
+        return;
+    }
+
 	int ret = mpi.mpi->reset(mpi.ctx);
 	assert(!ret);
 
@@ -694,6 +709,11 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
 	rtp_receiver->init();
 	codec = rtp_receiver->get_video_codec();
 
+    if (signal_flag) {
+        spdlog::info("Shutdown requested before video stream started; skipping decode setup");
+        return;
+    }
+
 	setup_mpi(packet);
 	
 	codec_detected.store(true);
@@ -718,16 +738,10 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
 		
 		osd_publish_uint_fact("rtp.received_bytes", NULL, 0, size);
         feed_packet_to_decoder(packet, data, size);
-        if (dvr_enabled && dvr != NULL && codec == VideoCodec::H265) {
-			auto frame = std::make_shared<std::vector<uint8_t>>(size);
-			std::memcpy(frame->data(), data, size);
-			dvr->frame(frame);
-        }
     };
 	rtp_receiver->start_receiving(cb);
 
-	// TODO: DVR Recording allowed only for H265 due unclear bug in librtp we receive corrupted data for H264 codec and due to that dvr can't write data correctly
-	if (dvr_autostart && dvr != NULL && codec == VideoCodec::H265) {
+    if (dvr_autostart && dvr != NULL) {
 		dvr->start_recording();
 	}
 
@@ -818,9 +832,13 @@ void printHelp() {
 	"\n"
     "    --dvr-start               - Start DVR immediately\n"
     "\n"
-    "    --dvr-framerate <rate>    - Force the dvr framerate for smoother dvr, ex: 60\n"
+    "    --dvr-framerate <rate>    - DVR record framerate; capped at --target-frame-rate (stream rate), ex: 30\n"
     "\n"
     "    --dvr-fmp4                - Save the video feed as a fragmented mp4\n"
+    "\n"
+    "    --dvr-osd                 - Burn OSD into DVR recording via RGA hardware blending\n"
+    "\n"
+    "    --dvr-bitrate <bps>       - Target bitrate for DVR re-encoding (Default: 8000000)\n"
     "\n"
     "    --screen-mode <mode>      - Override default screen mode. <width>x<heigth>@<fps> ex: 1920x1080@120\n"
     "\n"
@@ -856,9 +874,11 @@ int main(int argc, char **argv)
 	bool mavlink_thread = false;
 	int print_modelist = 0;
 	char* dvr_template = NULL;
-	int video_framerate = -1;
+    int dvr_framerate = -1;
 	int mp4_fragmentation_mode = 0;
 	bool dvr_filenames_with_sequence = false;
+    bool dvr_enable_osd = false;
+    int dvr_bitrate = 8000000;
 	uint16_t listen_port = 5600;
 	const char* unix_socket = NULL;
 	uint16_t wfb_port = 8003;
@@ -934,13 +954,29 @@ int main(int argc, char **argv)
             	printHelp();
             	return -1;
         	}
-        	video_framerate = static_cast<int>(v);
+            dvr_framerate = static_cast<int>(v);
         	break;
     	}
 
     	case OPT_DVR_FMP4: // --dvr-fmp4
         	mp4_fragmentation_mode = 1;
         	break;
+
+        case OPT_DVR_OSD: // --dvr-osd
+            dvr_enable_osd = true;
+            break;
+
+        case OPT_DVR_BITRATE: { // --dvr-bitrate
+            char *end = nullptr;
+            long v = strtol(optarg, &end, 10);
+            if (*end != '\0' || v <= 0) {
+                spdlog::error("--dvr-bitrate: invalid value '{}'", optarg);
+                printHelp();
+                return -1;
+            }
+            dvr_bitrate = static_cast<int>(v);
+            break;
+        }
 
     	case OPT_LOG_LEVEL: { // --log-level
         	std::string log_l(optarg);
@@ -1079,10 +1115,22 @@ int main(int argc, char **argv)
 
 	spdlog::set_level(log_level);
 
-	if (dvr_template != NULL && video_framerate < 0 ) {
+    if (dvr_template != NULL && dvr_framerate < 0 ) {
 		printf("--dvr-framerate must be provided when dvr is enabled.\n");
 		return 0;
 	}
+
+    // The DVR cannot record faster than the source delivers frames. Stamping the MP4
+    // at a higher fps than the stream produces fast-motion / duration-compressed video
+    // and, for the OSD path, overloads the RGA blend pipeline. Clamp the DVR framerate
+    // to the stream rate (target_frame_rate). Any lower value is fine — the frame gate
+    // in Dvr::frame() drops frames to match — and it need not be 30.
+    if (dvr_template != NULL && target_frame_rate > 0 &&
+        dvr_framerate > (int)target_frame_rate) {
+        spdlog::warn("--dvr-framerate {} exceeds stream rate {} fps; clamping to {}",
+                        dvr_framerate, target_frame_rate, target_frame_rate);
+        dvr_framerate = (int)target_frame_rate;
+    }
 
 	printVersion();
 	spdlog::info("disable_vsync: {}", disable_vsync);
@@ -1105,6 +1153,7 @@ int main(int argc, char **argv)
 	////////////////////////////////////////////// SIGNAL SETUP
 
 	signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
 	signal(SIGPIPE, sig_handler);
 	if (dvr_template) {
 		signal(SIGUSR1, sigusr1_handler);
@@ -1124,10 +1173,13 @@ int main(int argc, char **argv)
 		args.filename_template = dvr_template;
 		args.mp4_fragmentation_mode = mp4_fragmentation_mode;
 		args.dvr_filenames_with_sequence = dvr_filenames_with_sequence;
-		args.video_framerate = video_framerate;
+        args.dvr_framerate = dvr_framerate;
+        args.enable_osd_in_dvr = dvr_enable_osd;
+        args.dvr_bitrate = dvr_bitrate;
+        args.display_width  = output_list->mode.hdisplay;
+        args.display_height = output_list->mode.vdisplay;
 		args.video_p.video_frm_width = output_list->video_frm_width;
 		args.video_p.video_frm_height = output_list->video_frm_height;
-		args.video_p.codec = codec;
 		dvr = new Dvr(args);
 		ret = pthread_create(&tid_dvr, NULL, &Dvr::__THREAD__, dvr);
 	}
@@ -1197,9 +1249,12 @@ int main(int argc, char **argv)
     ret = pthread_join(tid_osd, NULL);
     assert(!ret);
 
-    if (dvr_template != NULL ) {
-		ret = pthread_join(tid_dvr, NULL);
-		assert(!ret);
+    if (dvr_template != NULL) {
+        if (dvr != NULL) {
+            dvr->shutdown();
+        }
+        ret = pthread_join(tid_dvr, NULL);
+        assert(!ret);
 	}
 
 	////////////////////////////////////////////// MPI CLEANUP

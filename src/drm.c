@@ -314,6 +314,7 @@ int modeset_create_fb(int fd, struct modeset_buf *buf)
 	int ret;
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
 
+	buf->prime_fd = -1;
 	memset(&creq, 0, sizeof(creq));
 	creq.width = buf->width;
 	creq.height = buf->height;
@@ -359,10 +360,20 @@ int modeset_create_fb(int fd, struct modeset_buf *buf)
 		goto err_fb;
 	}
 
+	ret = drmPrimeHandleToFD(fd, buf->handle, DRM_CLOEXEC | DRM_RDWR, &buf->prime_fd);
+	if (ret) {
+		fprintf(stderr, "cannot export prime fd (%d): %m\n", errno);
+		ret = -errno;
+		goto err_unmap;
+	}
+
 	memset(buf->map, 0, buf->size);
 
 	return 0;
 
+err_unmap:
+	munmap(buf->map, buf->size);
+	buf->map = NULL;
 err_fb:
 	drmModeRmFB(fd, buf->fb);
 err_destroy:
@@ -376,6 +387,11 @@ err_destroy:
 void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 {
 	struct drm_mode_destroy_dumb dreq;
+
+	if (buf->prime_fd >= 0) {
+		close(buf->prime_fd);
+		buf->prime_fd = -1;
+	}
 
 	munmap(buf->map, buf->size);
 

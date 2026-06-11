@@ -39,6 +39,7 @@ struct modeset_buf {
 	uint32_t size;
 	uint32_t handle;
 	uint8_t *map;
+	int      prime_fd;
 	uint32_t fb;
 };
 
