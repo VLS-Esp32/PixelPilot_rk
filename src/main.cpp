@@ -83,7 +83,6 @@ enum AppOption {
     OPT_DVR_START,
     OPT_DVR_TEMPLATE,
     OPT_DVR_SEQUENCED_FILES,
-    OPT_DVR_FRAMERATE,
     OPT_DVR_FMP4,
     OPT_DVR_OSD,
     OPT_DVR_BITRATE,
@@ -112,7 +111,6 @@ static const struct option pixelpilot_long_options[] = {
     {"dvr-start",           no_argument,       0, OPT_DVR_START},
     {"dvr-template",        required_argument, 0, OPT_DVR_TEMPLATE},
     {"dvr-sequenced-files", no_argument,       0, OPT_DVR_SEQUENCED_FILES},
-    {"dvr-framerate",       required_argument, 0, OPT_DVR_FRAMERATE},
     {"dvr-fmp4",            no_argument,       0, OPT_DVR_FMP4},
     {"dvr-osd",             no_argument,       0, OPT_DVR_OSD},
     {"dvr-bitrate",         required_argument, 0, OPT_DVR_BITRATE},
@@ -832,8 +830,6 @@ void printHelp() {
 	"\n"
     "    --dvr-start               - Start DVR immediately\n"
     "\n"
-    "    --dvr-framerate <rate>    - DVR record framerate; capped at --target-frame-rate (stream rate), ex: 30\n"
-    "\n"
     "    --dvr-fmp4                - Save the video feed as a fragmented mp4\n"
     "\n"
     "    --dvr-osd                 - Burn OSD into DVR recording via RGA hardware blending\n"
@@ -874,7 +870,6 @@ int main(int argc, char **argv)
 	bool mavlink_thread = false;
 	int print_modelist = 0;
 	char* dvr_template = NULL;
-    int dvr_framerate = -1;
 	int mp4_fragmentation_mode = 0;
 	bool dvr_filenames_with_sequence = false;
     bool dvr_enable_osd = false;
@@ -945,18 +940,6 @@ int main(int argc, char **argv)
     	case OPT_DVR_SEQUENCED_FILES: // --dvr-sequenced-files
         	dvr_filenames_with_sequence = true;
         	break;
-
-    	case OPT_DVR_FRAMERATE: { // --dvr-framerate
-        	char *end = nullptr;
-        	long v = strtol(optarg, &end, 10);
-        	if (*end != '\0' || v <= 0 || v > 120) {
-            	spdlog::error("--dvr-framerate: invalid value '{}'", optarg);
-            	printHelp();
-            	return -1;
-        	}
-            dvr_framerate = static_cast<int>(v);
-        	break;
-    	}
 
     	case OPT_DVR_FMP4: // --dvr-fmp4
         	mp4_fragmentation_mode = 1;
@@ -1115,23 +1098,6 @@ int main(int argc, char **argv)
 
 	spdlog::set_level(log_level);
 
-    if (dvr_template != NULL && dvr_framerate < 0 ) {
-		printf("--dvr-framerate must be provided when dvr is enabled.\n");
-		return 0;
-	}
-
-    // The DVR cannot record faster than the source delivers frames. Stamping the MP4
-    // at a higher fps than the stream produces fast-motion / duration-compressed video
-    // and, for the OSD path, overloads the RGA blend pipeline. Clamp the DVR framerate
-    // to the stream rate (target_frame_rate). Any lower value is fine — the frame gate
-    // in Dvr::frame() drops frames to match — and it need not be 30.
-    if (dvr_template != NULL && target_frame_rate > 0 &&
-        dvr_framerate > (int)target_frame_rate) {
-        spdlog::warn("--dvr-framerate {} exceeds stream rate {} fps; clamping to {}",
-                        dvr_framerate, target_frame_rate, target_frame_rate);
-        dvr_framerate = (int)target_frame_rate;
-    }
-
 	printVersion();
 	spdlog::info("disable_vsync: {}", disable_vsync);
 
@@ -1173,7 +1139,6 @@ int main(int argc, char **argv)
 		args.filename_template = dvr_template;
 		args.mp4_fragmentation_mode = mp4_fragmentation_mode;
 		args.dvr_filenames_with_sequence = dvr_filenames_with_sequence;
-        args.dvr_framerate = dvr_framerate;
         args.enable_osd_in_dvr = dvr_enable_osd;
         args.dvr_bitrate = dvr_bitrate;
         args.display_width  = output_list->mode.hdisplay;

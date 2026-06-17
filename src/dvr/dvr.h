@@ -3,6 +3,7 @@
 
 #include <queue>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <condition_variable>
 
@@ -43,9 +44,12 @@ private:
     char *filename_template;
     int  mp4_fragmentation_mode = 0;
     bool dvr_filenames_with_sequence = false;
-    int  dvr_framerate = -1;
     int  dvr_bitrate = 8000000;
     RecordingMode mode = RecordingMode::VideoOnly;
+
+    std::atomic<int> detected_fps{0};
+    int64_t  fps_measure_first_pts = -1;
+    uint32_t fps_measure_count = 0;
 
     uint32_t video_frm_width = 0;
     uint32_t video_frm_height = 0;
@@ -60,7 +64,6 @@ private:
 
     uint32_t frames_submitted = 0;
     uint32_t frames_written   = 0;
-    int64_t  last_fwd_pts = -1;          // PTS (ms) of last frame forwarded, for fps matching
     std::queue<int64_t> submitted_pts;   // FIFO of submitted frame PTS (ms), in encode order
     int64_t  last_written_pts = -1;      // PTS (ms) of last frame written to the MP4
 };

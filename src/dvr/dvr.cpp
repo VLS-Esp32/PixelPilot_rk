@@ -32,11 +32,24 @@ static const size_t DVR_MAX_PENDING_FRAMES = 3;
 static const int MP4_TIMEBASE_90K = 90000;  // minimp4 timescale (ticks per second)
 static const int MS_TO_90K        = 90;     // 1 ms = 90 ticks at 90kHz
 
+static const uint32_t FPS_MIN_FRAMES = 30;
+static const int64_t  FPS_MIN_PERIOD_MS = 500;
+
+// Round a measured fps to the closest standard fps rate (e.g. 30, 60) for a clean GOP
+static int round_to_standard_fps(int fps) {
+    static const int common[] = {24, 25, 30, 48, 50, 60, 90, 120};
+    for (int c : common) {
+        if (fps >= c - 2 && fps <= c + 2) {
+            return c;
+        }
+    }
+    return fps;
+}
+
 Dvr::Dvr(dvr_thread_params params) {
     filename_template           = params.filename_template;
     mp4_fragmentation_mode      = params.mp4_fragmentation_mode;
     dvr_filenames_with_sequence = params.dvr_filenames_with_sequence;
-    dvr_framerate               = params.dvr_framerate;
     dvr_bitrate                 = params.dvr_bitrate;
     mode = params.enable_osd_in_dvr ? RecordingMode::VideoWithOsd : RecordingMode::VideoOnly;
 
@@ -50,15 +63,25 @@ Dvr::Dvr(dvr_thread_params params) {
 Dvr::~Dvr() {}
 
 void Dvr::frame(dvr_frame_info info) {
-    // Frame-rate match - the decoder delivers frames at the stream rate (e.g. 60fps) but
-    // the DVR records at dvr_framerate (e.g. 30fps via --dvr-framerate). Drop frames whose 
-    // PTS hasn't advanced a full DVR frame interval since the last forwarded frame.
-    if (dvr_framerate > 0) {
-        int64_t interval_ms = 1000 / dvr_framerate;
-        if (last_fwd_pts >= 0 && (int64_t)info.pts - last_fwd_pts < interval_ms) {
-            return; // drop — too soon since last forwarded frame
+    if (fps_measure_first_pts < 0) {
+        fps_measure_first_pts = (int64_t)info.pts;
+        fps_measure_count = 0;
+    }
+
+    fps_measure_count++;
+    int64_t period_ms = (int64_t)info.pts - fps_measure_first_pts;
+    if (fps_measure_count >= FPS_MIN_FRAMES && period_ms >= FPS_MIN_PERIOD_MS) {
+        int fps = (int)(((int64_t)(fps_measure_count - 1) * 1000 + period_ms / 2) / period_ms);
+        if (fps < 1) {
+            fps = 1;
         }
-        last_fwd_pts = (int64_t)info.pts;
+        if (fps > 120) {
+            fps = 120;
+        }
+        detected_fps.store(round_to_standard_fps(fps));
+        // Reset the window so the estimate keeps tracking the stream.
+        fps_measure_first_pts = (int64_t)info.pts;
+        fps_measure_count = 0;
     }
 
     // Backpressure - we carry only the decoder buffer's prime_fd, and the decoder recycles
@@ -136,15 +159,14 @@ void Dvr::loop() {
         switch (rpc.command) {
         case dvr_rpc::RPC_SET_PARAMS:
             spdlog::debug("[ DVR ] got rpc SET_PARAMS");
-            if (writer.is_open())
+            if (writer.is_open() && detected_fps.load() > 0)
                 init();
             break;
         case dvr_rpc::RPC_START:
             spdlog::debug("[ DVR ] got rpc START");
             if (writer.is_open())
                 break;
-            if (start() == 0 && video_frm_width > 0 && video_frm_height > 0)
-                init();
+            start();
             break;
         case dvr_rpc::RPC_STOP:
             spdlog::debug("[ DVR ] got rpc STOP");
@@ -154,16 +176,22 @@ void Dvr::loop() {
         case dvr_rpc::RPC_TOGGLE:
             spdlog::debug("[ DVR ] got rpc TOGGLE");
             if (!writer.is_open()) {
-                if (start() == 0 && video_frm_width > 0 && video_frm_height > 0)
-                    init();
+                start(); // encoder init postponed to RPC_FRAME, see RPC_START
             } else {
                 stop();
             }
             break;
         case dvr_rpc::RPC_FRAME:
             if (!_ready_to_write) {
-                spdlog::debug("[ DVR ] RPC_FRAME: _ready_to_write=0, skipping");
-                break;
+                if (writer.is_open() && video_frm_width > 0 && video_frm_height > 0 &&
+                    detected_fps.load() > 0) {
+                    init();
+                }
+                if (!_ready_to_write) {
+                    spdlog::debug("[ DVR ] RPC_FRAME: _ready_to_write=0 measuring fps, fps={}), skipping",
+                                  detected_fps.load());
+                    break; // awaiting fps - drop this frame
+                }
             }
             encode_and_write(rpc.frame_info);
             break;
@@ -232,9 +260,10 @@ int Dvr::start() {
 }
 
 void Dvr::init() {
-    if (video_frm_width == 0 || video_frm_height == 0 || dvr_framerate <= 0) {
+    int fps = detected_fps.load();
+    if (video_frm_width == 0 || video_frm_height == 0 || fps <= 0) {
         spdlog::warn("[ DVR ] invalid video params {}x{} @{}",
-                     video_frm_width, video_frm_height, dvr_framerate);
+                     video_frm_width, video_frm_height, fps);
         return;
     }
 
@@ -257,7 +286,7 @@ void Dvr::init() {
         mp4_h = (int)disp_height;
         spdlog::info("[ DVR ] setting up dvr encoder {}x{} (video {}x{}) @{}fps bitrate={} H265 [OSD+RGA]",
                      disp_width, disp_height, video_frm_width, video_frm_height,
-                     dvr_framerate, dvr_bitrate);
+                     fps, dvr_bitrate);
     }
     else {
         enc_w = (int)video_frm_width;
@@ -267,10 +296,10 @@ void Dvr::init() {
         mp4_w = (int)video_frm_width;
         mp4_h = (int)video_frm_height;
         spdlog::info("[ DVR ] setting up dvr encoder {}x{} @{}fps bitrate={} H265 [zero-copy]",
-                     video_frm_width, video_frm_height, dvr_framerate, dvr_bitrate);
+                     video_frm_width, video_frm_height, fps, dvr_bitrate);
     }
 
-    if (!encoder.init(enc_w, enc_h, enc_hor, enc_ver, dvr_framerate, dvr_bitrate)) {
+    if (!encoder.init(enc_w, enc_h, enc_hor, enc_ver, fps, dvr_bitrate)) {
         osd.cleanup();
         return;
     }
@@ -283,7 +312,6 @@ void Dvr::init() {
 
     frames_submitted = 0;
     frames_written   = 0;
-    last_fwd_pts     = -1;
     last_written_pts = -1;
     while (!submitted_pts.empty()) {
         submitted_pts.pop();
@@ -302,7 +330,7 @@ int Dvr::next_frame_duration() {
     // frame and any implausible delta fall back to the nominal 1/fps duration. Packets are
     // emitted in submission order (IPPP, no B-frames), so the FIFO front always matches the
     // packet being written.
-    int duration = MP4_TIMEBASE_90K / dvr_framerate;
+    int duration = MP4_TIMEBASE_90K / detected_fps.load();
     if (!submitted_pts.empty()) {
         int64_t pts = submitted_pts.front();
         submitted_pts.pop();

@@ -23,7 +23,6 @@ struct dvr_thread_params {
     char *filename_template;
     int mp4_fragmentation_mode = 0;
     bool dvr_filenames_with_sequence = false;
-    int dvr_framerate = -1;
     bool enable_osd_in_dvr = false;
     int dvr_bitrate = 8000000;
     uint32_t display_width = 0;
