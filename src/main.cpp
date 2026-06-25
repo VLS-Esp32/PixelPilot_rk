@@ -161,6 +161,8 @@ int dvr_autostart = 0;
 int signal_flag = 0;
 
 void init_buffer(MppFrame frame) {
+	uint32_t prev_frm_width = output_list->video_frm_width;
+	uint32_t prev_frm_height = output_list->video_frm_height;
 	output_list->video_frm_width = mpp_frame_get_width(frame);
 	output_list->video_frm_height = mpp_frame_get_height(frame);
 	RK_U32 hor_stride = mpp_frame_get_hor_stride(frame);
@@ -273,6 +275,11 @@ void init_buffer(MppFrame frame) {
 	// dvr setup
 	if (dvr != NULL){
         dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height);
+        // A resolution change start new recording session
+        if (prev_frm_width != output_list->video_frm_width ||
+            prev_frm_height != output_list->video_frm_height) {
+            dvr->restart();
+        }
 	}
 }
 
@@ -683,6 +690,10 @@ void restart_mpi(MppPacket &packet, VideoCodec new_codec)
 	assert(!ret);
 	ret = pthread_mutex_unlock(&video_mutex);
 	assert(!ret);
+
+	if (dvr != NULL) {
+		dvr->restart();
+	}
 
 	cleanup_mpi(packet);
 	setup_mpi(packet);

@@ -2,6 +2,7 @@
 #include <cstring>
 #include <algorithm>
 #include <pthread.h>
+#include <unistd.h>
 #include <sys/mman.h>
 
 #include <rockchip/rk_mpi.h>
@@ -174,6 +175,12 @@ MppBuffer OsdCompositor::compose(const dvr_frame_info &info) {
             copy_ok = true;
         } else {
             spdlog::warn("[ DVR OsdCompositor ] RGA scale failed ({}), using CPU fallback", (int)rga_ret);
+            long real_size = lseek(info.prime_fd, 0, SEEK_END);
+            if (real_size < 0 || (size_t)real_size < info.buf_size) {
+                spdlog::warn("[ DVR OsdCompositor ] deprecated/undersized buffer (fd {} real {} < {}), dropping frame",
+                             info.prime_fd, real_size, info.buf_size);
+                return nullptr;
+            }
             void *src_ptr = mmap(nullptr, info.buf_size, PROT_READ, MAP_SHARED, info.prime_fd, 0);
             if (src_ptr != MAP_FAILED) {
                 size_t copy_sz = std::min(info.buf_size,

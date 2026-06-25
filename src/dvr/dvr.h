@@ -19,6 +19,7 @@ public:
 
     void frame(dvr_frame_info info);
     void set_video_params(uint32_t video_frm_width, uint32_t video_frm_height);
+    void restart();
     void start_recording();
     void stop_recording();
     void toggle_recording();
@@ -27,10 +28,13 @@ public:
     static void *__THREAD__(void *context);
 private:
     void enqueue_dvr_command(dvr_rpc rpc);
+    void drop_pending_frames();
 
     void loop();
     int  start();
     void stop();
+    void rotate_recording_file();
+    void finalize_current_file();
     void init();
     std::string generate_filename();
     int  next_frame_duration();
@@ -61,6 +65,8 @@ private:
     MppEncoder    encoder;
     OsdCompositor osd;
     Mp4Writer     writer;
+
+    std::string current_filename;
 
     uint32_t frames_submitted = 0;
     uint32_t frames_written   = 0;

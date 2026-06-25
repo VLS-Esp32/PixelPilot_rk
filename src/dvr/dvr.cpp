@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <sstream>
 #include <filesystem>
+#include <system_error>
 #include <algorithm>
 #include <regex>
 
@@ -100,10 +101,37 @@ void Dvr::frame(dvr_frame_info info) {
     cv.notify_one();
 }
 
+void Dvr::drop_pending_frames() {
+    std::queue<dvr_rpc> kept;
+    while (!dvrQueue.empty()) {
+        if (dvrQueue.front().command != dvr_rpc::RPC_FRAME) {
+            kept.push(dvrQueue.front());
+        }
+        dvrQueue.pop();
+    }
+    dvrQueue.swap(kept);
+}
+
 void Dvr::set_video_params(uint32_t video_frm_w, uint32_t video_frm_h) {
+    std::lock_guard<std::mutex> lock(mtx);
     video_frm_width = video_frm_w;
     video_frm_height = video_frm_h;
-    enqueue_dvr_command({ .command = dvr_rpc::RPC_SET_PARAMS });
+    drop_pending_frames();
+
+    fps_measure_first_pts = -1;
+    fps_measure_count = 0;
+}
+
+void Dvr::restart() {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        drop_pending_frames();
+        fps_measure_first_pts = -1;
+        fps_measure_count = 0;
+        detected_fps.store(0);
+        dvrQueue.push({ .command = dvr_rpc::RPC_SET_PARAMS });
+    }
+    cv.notify_one();
 }
 
 void Dvr::start_recording() {
@@ -159,8 +187,8 @@ void Dvr::loop() {
         switch (rpc.command) {
         case dvr_rpc::RPC_SET_PARAMS:
             spdlog::debug("[ DVR ] got rpc SET_PARAMS");
-            if (writer.is_open() && detected_fps.load() > 0)
-                init();
+            if (writer.is_open())
+                rotate_recording_file();
             break;
         case dvr_rpc::RPC_START:
             spdlog::debug("[ DVR ] got rpc START");
@@ -253,6 +281,7 @@ int Dvr::start() {
     if (!writer.open(mp4_filename, mp4_fragmentation_mode)) {
         return -1;
     }
+    current_filename = mp4_filename;
 
     osd_publish_bool_fact("dvr.recording", NULL, 0, true);
     dvr_enabled = 1;
@@ -408,7 +437,7 @@ void Dvr::encode_and_write(dvr_frame_info info) {
     }
 }
 
-void Dvr::stop() {
+void Dvr::finalize_current_file() {
     if (encoder.ready() && _ready_to_write) {
         // Write output from the last submission, then flush the encoder
         encoder.drain([this](const uint8_t *data, int len) {
@@ -429,11 +458,34 @@ void Dvr::stop() {
 
     encoder.cleanup();
     osd.cleanup();
-    writer.close();
 
+    bool empty = (frames_written == 0);
+    writer.close();
+    _ready_to_write = 0;
+
+    if (empty && !current_filename.empty()) {
+        std::error_code ec;
+        fs::remove(current_filename, ec);
+        if (ec) {
+            spdlog::warn("[ DVR ] failed to remove empty recording {}: {}", current_filename, ec.message());
+        } else {
+            spdlog::info("[ DVR ] removed empty recording {}", current_filename);
+        }
+    }
+    current_filename.clear();
+}
+
+void Dvr::stop() {
+    finalize_current_file();
     osd_publish_bool_fact("dvr.recording", NULL, 0, false);
     dvr_enabled = 0;
-    _ready_to_write = 0;
+}
+
+void Dvr::rotate_recording_file() {
+    finalize_current_file();
+    if (start() != 0) {
+        spdlog::error("[ DVR ] failed to open next recording file");
+    }
 }
 
 // C-compatible interface
