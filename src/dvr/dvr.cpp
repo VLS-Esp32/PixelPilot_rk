@@ -52,6 +52,7 @@ Dvr::Dvr(dvr_thread_params params) {
     mp4_fragmentation_mode      = params.mp4_fragmentation_mode;
     dvr_filenames_with_sequence = params.dvr_filenames_with_sequence;
     dvr_bitrate                 = params.dvr_bitrate;
+    segment_limit_ms            = (int64_t)params.dvr_segment_minutes * 60 * 1000;
     mode = params.enable_osd_in_dvr ? RecordingMode::VideoWithOsd : RecordingMode::VideoOnly;
 
     video_frm_width  = params.video_p.video_frm_width;
@@ -209,7 +210,13 @@ void Dvr::loop() {
                 stop();
             }
             break;
-        case dvr_rpc::RPC_FRAME:
+        case dvr_rpc::RPC_FRAME: {
+            int64_t pts = (int64_t)rpc.frame_info.pts;
+            if (_ready_to_write && segment_limit_ms > 0 && segment_start_pts >= 0 &&
+                pts - segment_start_pts >= segment_limit_ms) {
+                spdlog::info("[ DVR ] segment time limit reached, starting new file");
+                rotate_recording_file();
+            }
             if (!_ready_to_write) {
                 if (writer.is_open() && video_frm_width > 0 && video_frm_height > 0 &&
                     detected_fps.load() > 0) {
@@ -221,8 +228,12 @@ void Dvr::loop() {
                     break; // awaiting fps - drop this frame
                 }
             }
+            if (segment_start_pts < 0) {
+                segment_start_pts = pts;
+            }
             encode_and_write(rpc.frame_info);
             break;
+        }
         case dvr_rpc::RPC_SHUTDOWN:
             spdlog::debug("[ DVR ] got rpc SHUTDOWN");
             goto end;
@@ -473,6 +484,7 @@ void Dvr::finalize_current_file() {
         }
     }
     current_filename.clear();
+    segment_start_pts = -1;
 }
 
 void Dvr::stop() {

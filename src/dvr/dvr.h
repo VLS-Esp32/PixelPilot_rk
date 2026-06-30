@@ -49,6 +49,8 @@ private:
     int  mp4_fragmentation_mode = 0;
     bool dvr_filenames_with_sequence = false;
     int  dvr_bitrate = 8000000;
+    int64_t segment_limit_ms = 0;
+    int64_t segment_start_pts = -1;
     RecordingMode mode = RecordingMode::VideoOnly;
 
     std::atomic<int> detected_fps{0};

@@ -25,6 +25,7 @@ struct dvr_thread_params {
     bool dvr_filenames_with_sequence = false;
     bool enable_osd_in_dvr = false;
     int dvr_bitrate = 8000000;
+    int dvr_segment_minutes = 0;
     uint32_t display_width = 0;
     uint32_t display_height = 0;
     video_params video_p;

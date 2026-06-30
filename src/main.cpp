@@ -86,6 +86,7 @@ enum AppOption {
     OPT_DVR_FMP4,
     OPT_DVR_OSD,
     OPT_DVR_BITRATE,
+    OPT_DVR_SEGMENT_TIME,
     OPT_LOG_LEVEL,
     OPT_MAVLINK_PORT,
     OPT_MAVLINK_DVR_ON_ARM,
@@ -114,6 +115,7 @@ static const struct option pixelpilot_long_options[] = {
     {"dvr-fmp4",            no_argument,       0, OPT_DVR_FMP4},
     {"dvr-osd",             no_argument,       0, OPT_DVR_OSD},
     {"dvr-bitrate",         required_argument, 0, OPT_DVR_BITRATE},
+    {"dvr-segment-time",    required_argument, 0, OPT_DVR_SEGMENT_TIME},
     {"log-level",           required_argument, 0, OPT_LOG_LEVEL},
     {"mavlink-port",        required_argument, 0, OPT_MAVLINK_PORT},
     {"mavlink-dvr-on-arm",  no_argument,       0, OPT_MAVLINK_DVR_ON_ARM},
@@ -847,6 +849,8 @@ void printHelp() {
     "\n"
     "    --dvr-bitrate <bps>       - Target bitrate for DVR re-encoding (Default: 8000000)\n"
     "\n"
+    "    --dvr-segment-time <min>  - Start a new DVR file every N minutes (0 = disabled, Default: 0)\n"
+    "\n"
     "    --screen-mode <mode>      - Override default screen mode. <width>x<heigth>@<fps> ex: 1920x1080@120\n"
     "\n"
 	"    --target-frame-rate <fps> - Target DRM refresh rate for mode selection (30..120), ex: 60\n"
@@ -885,6 +889,7 @@ int main(int argc, char **argv)
 	bool dvr_filenames_with_sequence = false;
     bool dvr_enable_osd = false;
     int dvr_bitrate = 8000000;
+    int dvr_segment_minutes = 0;
 	uint16_t listen_port = 5600;
 	const char* unix_socket = NULL;
 	uint16_t wfb_port = 8003;
@@ -969,6 +974,18 @@ int main(int argc, char **argv)
                 return -1;
             }
             dvr_bitrate = static_cast<int>(v);
+            break;
+        }
+
+        case OPT_DVR_SEGMENT_TIME: { // --dvr-segment-time
+            char *end = nullptr;
+            long v = strtol(optarg, &end, 10);
+            if (*end != '\0' || v < 0 || v > 60) {
+                spdlog::error("--dvr-segment-time: invalid value '{}' (expected 0..60 minutes)", optarg);
+                printHelp();
+                return -1;
+            }
+            dvr_segment_minutes = static_cast<int>(v);
             break;
         }
 
@@ -1152,6 +1169,7 @@ int main(int argc, char **argv)
 		args.dvr_filenames_with_sequence = dvr_filenames_with_sequence;
         args.enable_osd_in_dvr = dvr_enable_osd;
         args.dvr_bitrate = dvr_bitrate;
+        args.dvr_segment_minutes = dvr_segment_minutes;
         args.display_width  = output_list->mode.hdisplay;
         args.display_height = output_list->mode.vdisplay;
 		args.video_p.video_frm_width = output_list->video_frm_width;
