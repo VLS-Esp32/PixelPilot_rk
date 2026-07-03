@@ -7,7 +7,10 @@
 #define RTP_CODEC_DETECTOR_H
 
 #include "common.h"
+#include <cstdint>
 #include <memory>
+
+VideoCodec rtp_classify_codec(const uint8_t *rtp_packet, int len);
 
 
 class RtpCodecDecoder {

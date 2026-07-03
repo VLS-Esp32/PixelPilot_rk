@@ -733,6 +733,12 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
 	auto cb=[&packet, &rtp_receiver, /*&decoder_stalled_count,*/ &bytes_received, &period_start](void *data, int size, bool is_codec_changed){
+		if (is_codec_changed)
+		{
+			codec_changed.store(true);
+			return;
+		}
+
 		uint64_t now = get_time_ms();
 		last_demux_output_ms.store(now);
 
@@ -741,12 +747,8 @@ void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
             video_present.store(true);
         }
 
-		if (is_codec_changed)
-		{
-			codec_changed.store(true);
-		}
 		bytes_received += size;
-		
+
 		osd_publish_uint_fact("rtp.received_bytes", NULL, 0, size);
         feed_packet_to_decoder(packet, data, size);
     };

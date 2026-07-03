@@ -294,6 +294,13 @@ int Dvr::start() {
     }
     current_filename = mp4_filename;
 
+    frames_submitted = 0;
+    frames_written   = 0;
+    last_written_pts = -1;
+    while (!submitted_pts.empty()) {
+        submitted_pts.pop();
+    }
+
     osd_publish_bool_fact("dvr.recording", NULL, 0, true);
     dvr_enabled = 1;
     return 0;
@@ -348,13 +355,6 @@ void Dvr::init() {
         encoder.cleanup();
         osd.cleanup();
         return;
-    }
-
-    frames_submitted = 0;
-    frames_written   = 0;
-    last_written_pts = -1;
-    while (!submitted_pts.empty()) {
-        submitted_pts.pop();
     }
 
     _ready_to_write = 1;
