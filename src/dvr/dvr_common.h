@@ -26,6 +26,8 @@ struct dvr_thread_params {
     bool enable_osd_in_dvr = false;
     int dvr_bitrate = 8000000;
     int dvr_segment_minutes = 0;
+    uint64_t dvr_min_free_bytes = 200ULL * 1024 * 1024;
+    bool dvr_require_mount = false;
     uint32_t display_width = 0;
     uint32_t display_height = 0;
     video_params video_p;

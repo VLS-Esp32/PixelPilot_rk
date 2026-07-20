@@ -87,6 +87,8 @@ enum AppOption {
     OPT_DVR_OSD,
     OPT_DVR_BITRATE,
     OPT_DVR_SEGMENT_TIME,
+    OPT_DVR_MIN_FREE_MB,
+    OPT_DVR_REQUIRE_MOUNT,
     OPT_LOG_LEVEL,
     OPT_MAVLINK_PORT,
     OPT_MAVLINK_DVR_ON_ARM,
@@ -116,6 +118,8 @@ static const struct option pixelpilot_long_options[] = {
     {"dvr-osd",             no_argument,       0, OPT_DVR_OSD},
     {"dvr-bitrate",         required_argument, 0, OPT_DVR_BITRATE},
     {"dvr-segment-time",    required_argument, 0, OPT_DVR_SEGMENT_TIME},
+    {"dvr-min-free-mb",     required_argument, 0, OPT_DVR_MIN_FREE_MB},
+    {"dvr-require-mount",   no_argument,       0, OPT_DVR_REQUIRE_MOUNT},
     {"log-level",           required_argument, 0, OPT_LOG_LEVEL},
     {"mavlink-port",        required_argument, 0, OPT_MAVLINK_PORT},
     {"mavlink-dvr-on-arm",  no_argument,       0, OPT_MAVLINK_DVR_ON_ARM},
@@ -853,6 +857,10 @@ void printHelp() {
     "\n"
     "    --dvr-segment-time <min>  - Start a new DVR file every N minutes (0 = disabled, Default: 0)\n"
     "\n"
+    "    --dvr-min-free-mb <MB>    - Stop/refuse DVR recording below this free space (Default: 200)\n"
+    "\n"
+    "    --dvr-require-mount       - Only record if the DVR directory is on a mounted external device\n"
+    "\n"
     "    --screen-mode <mode>      - Override default screen mode. <width>x<heigth>@<fps> ex: 1920x1080@120\n"
     "\n"
 	"    --target-frame-rate <fps> - Target DRM refresh rate for mode selection (30..120), ex: 60\n"
@@ -892,6 +900,8 @@ int main(int argc, char **argv)
     bool dvr_enable_osd = false;
     int dvr_bitrate = 8000000;
     int dvr_segment_minutes = 0;
+    int dvr_min_free_mb = 200;
+    bool dvr_require_mount = false;
 	uint16_t listen_port = 5600;
 	const char* unix_socket = NULL;
 	uint16_t wfb_port = 8003;
@@ -990,6 +1000,22 @@ int main(int argc, char **argv)
             dvr_segment_minutes = static_cast<int>(v);
             break;
         }
+
+        case OPT_DVR_MIN_FREE_MB: { // --dvr-min-free-mb
+            char *end = nullptr;
+            long v = strtol(optarg, &end, 10);
+            if (*end != '\0' || v <= 0) {
+                spdlog::error("--dvr-min-free-mb: invalid value '{}'", optarg);
+                printHelp();
+                return -1;
+            }
+            dvr_min_free_mb = static_cast<int>(v);
+            break;
+        }
+
+        case OPT_DVR_REQUIRE_MOUNT: // --dvr-require-mount
+            dvr_require_mount = true;
+            break;
 
     	case OPT_LOG_LEVEL: { // --log-level
         	std::string log_l(optarg);
@@ -1172,6 +1198,8 @@ int main(int argc, char **argv)
         args.enable_osd_in_dvr = dvr_enable_osd;
         args.dvr_bitrate = dvr_bitrate;
         args.dvr_segment_minutes = dvr_segment_minutes;
+        args.dvr_min_free_bytes = (uint64_t)dvr_min_free_mb * 1024 * 1024;
+        args.dvr_require_mount = dvr_require_mount;
         args.display_width  = output_list->mode.hdisplay;
         args.display_height = output_list->mode.vdisplay;
 		args.video_p.video_frm_width = output_list->video_frm_width;

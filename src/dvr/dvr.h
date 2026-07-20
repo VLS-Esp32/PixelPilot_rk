@@ -11,6 +11,7 @@
 #include "mpp_encoder.h"
 #include "osd_compositor.h"
 #include "mp4_writer.h"
+#include "storage_guard.h"
 
 class Dvr {
 public:
@@ -52,6 +53,11 @@ private:
     int64_t segment_limit_ms = 0;
     int64_t segment_start_pts = -1;
     RecordingMode mode = RecordingMode::VideoOnly;
+
+    std::string rec_dir;
+    StorageGuard storage;
+    uint64_t max_file_bytes = 0;
+    int64_t  last_storage_check_ms = 0;
 
     std::atomic<int> detected_fps{0};
     int64_t  fps_measure_first_pts = -1;

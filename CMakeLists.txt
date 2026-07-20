@@ -25,6 +25,8 @@ set(SOURCE_FILES
         src/dvr/osd_compositor.cpp
         src/dvr/mp4_writer.h
         src/dvr/mp4_writer.cpp
+        src/dvr/storage_guard.h
+        src/dvr/storage_guard.cpp
         src/dvr/dvr.h
         src/dvr/dvr.cpp
         src/mavlink.h

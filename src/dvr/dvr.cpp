@@ -36,6 +36,15 @@ static const int MS_TO_90K        = 90;     // 1 ms = 90 ticks at 90kHz
 static const uint32_t FPS_MIN_FRAMES = 30;
 static const int64_t  FPS_MIN_PERIOD_MS = 500;
 
+//Periodic storage guard check runs during recording (free-space / mount check).
+static const int64_t  STORAGE_CHECK_INTERVAL_MS = 3000;
+
+static int64_t monotonic_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 // Round a measured fps to the closest standard fps rate (e.g. 30, 60) for a clean GOP
 static int round_to_standard_fps(int fps) {
     static const int common[] = {24, 25, 30, 48, 50, 60, 90, 120};
@@ -47,7 +56,9 @@ static int round_to_standard_fps(int fps) {
     return fps;
 }
 
-Dvr::Dvr(dvr_thread_params params) {
+Dvr::Dvr(dvr_thread_params params)
+    : rec_dir(fs::path(params.filename_template).parent_path().string()),
+      storage(rec_dir, params.dvr_min_free_bytes, params.dvr_require_mount) {
     filename_template           = params.filename_template;
     mp4_fragmentation_mode      = params.mp4_fragmentation_mode;
     dvr_filenames_with_sequence = params.dvr_filenames_with_sequence;
@@ -212,6 +223,28 @@ void Dvr::loop() {
             break;
         case dvr_rpc::RPC_FRAME: {
             int64_t pts = (int64_t)rpc.frame_info.pts;
+
+            // Periodic storage guard check: fail-stop if the mount vanished or free
+            // space dropped below the threshold.
+            if (_ready_to_write) {
+                int64_t now_ms = monotonic_ms();
+                if (now_ms - last_storage_check_ms >= STORAGE_CHECK_INTERVAL_MS) {
+                    last_storage_check_ms = now_ms;
+                    std::string reason;
+                    if (!storage.is_ready(reason)) {
+                        spdlog::warn("[ DVR ] {}, stopping recording", reason);
+                        stop();
+                        break;
+                    }
+                }
+            }
+
+            // FAT32 per-file size cap: rotate before reaching the 4GB.
+            if (_ready_to_write && max_file_bytes > 0 && writer.size() >= max_file_bytes) {
+                spdlog::info("[ DVR ] file size cap reached, starting new file");
+                rotate_recording_file();
+            }
+
             if (_ready_to_write && segment_limit_ms > 0 && segment_start_pts >= 0 &&
                 pts - segment_start_pts >= segment_limit_ms) {
                 spdlog::info("[ DVR ] segment time limit reached, starting new file");
@@ -248,7 +281,6 @@ end:
 
 std::string Dvr::generate_filename() {
     fs::path pathObj(filename_template);
-    std::string rec_dir = pathObj.parent_path().string();
     std::string filename_pattern = pathObj.filename().string();
     std::string paddedNumber = "";
 
@@ -285,6 +317,13 @@ std::string Dvr::generate_filename() {
 }
 
 int Dvr::start() {
+    std::string reason;
+    if (!storage.is_ready(reason)) {
+        spdlog::error("[ DVR ] not starting recording: {}", reason);
+        osd_publish_bool_fact("dvr.recording", NULL, 0, false);
+        return -1;
+    }
+
     std::string mp4_filename = generate_filename();
     if (mp4_filename.empty()) {
         return -1;
@@ -293,6 +332,11 @@ int Dvr::start() {
         return -1;
     }
     current_filename = mp4_filename;
+
+    max_file_bytes = storage.file_size_cap();
+    spdlog::info("[ DVR ] storage: {}MB free, per-file cap {}MB",
+                 storage.free_bytes() / (1024 * 1024),
+                 max_file_bytes / (1024 * 1024));
 
     frames_submitted = 0;
     frames_written   = 0;
@@ -496,7 +540,9 @@ void Dvr::stop() {
 void Dvr::rotate_recording_file() {
     finalize_current_file();
     if (start() != 0) {
-        spdlog::error("[ DVR ] failed to open next recording file");
+        spdlog::error("[ DVR ] failed to open next recording file, stopping recording");
+        osd_publish_bool_fact("dvr.recording", NULL, 0, false);
+        dvr_enabled = 0;
     }
 }
 

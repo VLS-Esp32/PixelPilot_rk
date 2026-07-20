@@ -6,9 +6,19 @@
 #include "../minimp4.h"
 
 static int mp4_write_callback(int64_t offset, const void *buffer, size_t size, void *token) {
-    FILE *f = (FILE *)token;
-    fseek(f, offset, SEEK_SET);
-    return fwrite(buffer, 1, size, f) != size;
+    return ((Mp4Writer *)token)->write_at(offset, buffer, size);
+}
+
+int Mp4Writer::write_at(int64_t offset, const void *buf, size_t n) {
+    fseek(file, offset, SEEK_SET);
+    if (fwrite(buf, 1, n, file) != n) {
+        return 1; // short write (e.g. disk full)
+    }
+    uint64_t end = (uint64_t)offset + n;
+    if (end > file_size_bytes) {
+        file_size_bytes = end;
+    }
+    return 0;
 }
 
 Mp4Writer::Mp4Writer() {
@@ -25,7 +35,8 @@ bool Mp4Writer::open(const std::string &path, int frag_mode) {
         spdlog::error("[ DVR Mp4Writer ] unable to open DVR file {}", path);
         return false;
     }
-    mux = MP4E_open(0 /*sequential_mode*/, frag_mode, file, mp4_write_callback);
+    file_size_bytes = 0;
+    mux = MP4E_open(0 /*sequential_mode*/, frag_mode, this, mp4_write_callback);
     return true;
 }
 
