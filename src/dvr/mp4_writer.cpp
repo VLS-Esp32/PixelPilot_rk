@@ -51,20 +51,28 @@ bool Mp4Writer::begin_video(int width, int height) {
 bool Mp4Writer::write_nal(const uint8_t *data, int len, int duration_90k) {
     auto res = mp4_h26x_write_nal(writer, data, len, duration_90k);
     if (res != MP4E_STATUS_OK && res != MP4E_STATUS_BAD_ARGUMENTS) {
-        spdlog::warn("[ DVR Mp4Writer ] mp4_h26x_write_nal failed {}", (int)res);
+        if (write_fail_count % WRITE_FAIL_WARN_INTERVAL == 0) {
+            spdlog::warn("[ DVR Mp4Writer ] mp4_h26x_write_nal failed {} ({} times)",
+                         (int)res, write_fail_count + 1);
+        }
+        write_fail_count++;
         return false;
     }
+    write_fail_count = 0;
     return true;
 }
 
-void Mp4Writer::close() {
+bool Mp4Writer::close() {
+    int mux_status = MP4E_STATUS_OK;
     if (mux) {
-        MP4E_close(mux);
+        mux_status = MP4E_close(mux); // writes the moov/index in non-sequential mode
         mux = nullptr;
     }
     mp4_h26x_write_close(writer);
+    int fclose_ret = 0;
     if (file) {
-        fclose(file);
+        fclose_ret = fclose(file);
         file = nullptr;
     }
+    return mux_status == MP4E_STATUS_OK && fclose_ret == 0;
 }

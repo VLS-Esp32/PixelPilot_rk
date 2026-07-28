@@ -39,6 +39,9 @@ static const int64_t  FPS_MIN_PERIOD_MS = 500;
 //Periodic storage guard check runs during recording (free-space / mount check).
 static const int64_t  STORAGE_CHECK_INTERVAL_MS = 3000;
 
+// Consecutive failed frame writes (disk full / I/O error) before we fail-stop the recording.
+static const uint32_t MAX_CONSECUTIVE_WRITE_FAILURES = 5;
+
 static int64_t monotonic_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -265,6 +268,12 @@ void Dvr::loop() {
                 segment_start_pts = pts;
             }
             encode_and_write(rpc.frame_info);
+
+            if (consecutive_write_failures >= MAX_CONSECUTIVE_WRITE_FAILURES) {
+                spdlog::error("[ DVR ] {} consecutive write failures (disk full or I/O error), stopping recording",
+                              consecutive_write_failures);
+                stop();
+            }
             break;
         }
         case dvr_rpc::RPC_SHUTDOWN:
@@ -340,6 +349,7 @@ int Dvr::start() {
 
     frames_submitted = 0;
     frames_written   = 0;
+    consecutive_write_failures = 0;
     last_written_pts = -1;
     while (!submitted_pts.empty()) {
         submitted_pts.pop();
@@ -456,6 +466,9 @@ void Dvr::encode_and_write(dvr_frame_info info) {
     encoder.drain([this](const uint8_t *data, int len) {
         if (writer.write_nal(data, len, next_frame_duration())) {
             frames_written++;
+            consecutive_write_failures = 0;
+        } else {
+            consecutive_write_failures++;
         }
     });
 
@@ -515,8 +528,13 @@ void Dvr::finalize_current_file() {
     osd.cleanup();
 
     bool empty = (frames_written == 0);
-    writer.close();
+    bool finalized_ok = writer.close();
     _ready_to_write = 0;
+
+    if (!empty && !finalized_ok && !current_filename.empty()) {
+        spdlog::error("[ DVR ] recording incomplete (index/moov write failed): {} — may need repair",
+                      current_filename);
+    }
 
     if (empty && !current_filename.empty()) {
         std::error_code ec;

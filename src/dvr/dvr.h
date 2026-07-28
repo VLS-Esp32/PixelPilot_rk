@@ -78,6 +78,7 @@ private:
 
     uint32_t frames_submitted = 0;
     uint32_t frames_written   = 0;
+    uint32_t consecutive_write_failures = 0;  // resets on any successful NAL write; drives fail-stop
     std::queue<int64_t> submitted_pts;   // FIFO of submitted frame PTS (ms), in encode order
     int64_t  last_written_pts = -1;      // PTS (ms) of last frame written to the MP4
 };

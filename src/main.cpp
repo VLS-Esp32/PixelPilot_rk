@@ -1004,7 +1004,7 @@ int main(int argc, char **argv)
         case OPT_DVR_MIN_FREE_MB: { // --dvr-min-free-mb
             char *end = nullptr;
             long v = strtol(optarg, &end, 10);
-            if (*end != '\0' || v <= 0) {
+            if (*end != '\0' || v < 0) {
                 spdlog::error("--dvr-min-free-mb: invalid value '{}'", optarg);
                 printHelp();
                 return -1;
