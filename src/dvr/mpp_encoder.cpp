@@ -9,9 +9,10 @@
 static const int GOP_SECONDS = 2; // keyframe interval
 
 bool MppEncoder::init(int width, int height, int hor_stride, int ver_stride,
-                      int fps, int bitrate) {
+                      int fps, int bitrate, MppFrameFormat format) {
     cfg_hor_stride = hor_stride;
     cfg_ver_stride = ver_stride;
+    cfg_format     = format;
 
     int ret = mpp_create(&ctx, &mpi);
     if (ret) {
@@ -45,7 +46,7 @@ bool MppEncoder::init(int width, int height, int hor_stride, int ver_stride,
     mpp_enc_cfg_set_s32(cfg, "prep:height",      height);
     mpp_enc_cfg_set_s32(cfg, "prep:hor_stride",  hor_stride);
     mpp_enc_cfg_set_s32(cfg, "prep:ver_stride",  ver_stride);
-    mpp_enc_cfg_set_s32(cfg, "prep:format",      MPP_FMT_YUV420SP);
+    mpp_enc_cfg_set_s32(cfg, "prep:format",      format);
 
     // rc: rate control (VBR around the target bitrate)
     mpp_enc_cfg_set_s32(cfg, "rc:mode",          MPP_ENC_RC_MODE_VBR);
@@ -106,7 +107,7 @@ int MppEncoder::submit(MppBuffer buf, int64_t pts, int width, int height,
     mpp_frame_set_height(frame,     height);
     mpp_frame_set_hor_stride(frame, hor_stride);
     mpp_frame_set_ver_stride(frame, ver_stride);
-    mpp_frame_set_fmt(frame,        MPP_FMT_YUV420SP);
+    mpp_frame_set_fmt(frame,        cfg_format);
     mpp_frame_set_pts(frame,        (RK_S64)pts);
     mpp_frame_set_buffer(frame,     buf);
 

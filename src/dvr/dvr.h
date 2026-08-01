@@ -3,13 +3,11 @@
 
 #include <queue>
 #include <mutex>
-#include <atomic>
 #include <string>
 #include <condition_variable>
 
 #include "dvr_common.h"
 #include "mpp_encoder.h"
-#include "osd_compositor.h"
 #include "mp4_writer.h"
 #include "storage_guard.h"
 
@@ -19,6 +17,9 @@ public:
     virtual ~Dvr();
 
     void frame(dvr_frame_info info);
+    // Writeback (WYSIWYG) ingress: fed the composited display output from the display thread
+    // (VideoWithOsdWriteback mode) instead of decoded frames from the decode thread.
+    void writeback_frame(dvr_frame_info info);
     void set_video_params(uint32_t video_frm_width, uint32_t video_frm_height);
     void restart();
     void start_recording();
@@ -41,6 +42,7 @@ private:
     int  next_frame_duration();
     MppBuffer import_decoder_buffer(const dvr_frame_info &info);
     void encode_and_write(dvr_frame_info info);
+    void encode_and_write_wb(dvr_frame_info info);
 
     std::queue<dvr_rpc> dvrQueue;
     std::mutex mtx;
@@ -51,36 +53,44 @@ private:
     bool dvr_filenames_with_sequence = false;
     int  dvr_bitrate = 8000000;
     int64_t segment_limit_ms = 0;
-    int64_t segment_start_pts = -1;
+    int64_t segment_video_ticks = 0;
     RecordingMode mode = RecordingMode::VideoOnly;
 
     std::string rec_dir;
     StorageGuard storage;
     uint64_t max_file_bytes = 0;
+    uint64_t session_free_at_start = 0;  // free bytes at recording start; mid-recording est baseline
     int64_t  last_storage_check_ms = 0;
 
-    std::atomic<int> detected_fps{0};
-    int64_t  fps_measure_first_pts = -1;
-    uint32_t fps_measure_count = 0;
+    // Recording frame rate = the display refresh rate (the writeback recording is a screen capture,
+    // so its natural rate is the display's).
+    int enc_fps = 0;
 
     uint32_t video_frm_width = 0;
     uint32_t video_frm_height = 0;
-    uint32_t disp_width = 0;   // encoder output: display res, or video native if no display
-    uint32_t disp_height = 0;
+
+    // Writeback mode geometry (VideoWithOsdWriteback): the composited buffer the display thread
+    // hands us. wb_nv12 selects the encoder input format (NV12 native vs BGRA).
+    bool     wb_nv12 = false;
+    uint32_t wb_enc_width = 0;
+    uint32_t wb_enc_height = 0;
+    uint32_t wb_enc_hor_stride = 0;   // bytes (Y stride for NV12, or BGRA byte stride)
+    uint32_t wb_enc_ver_stride = 0;   // aligned rows (matches the WB buffer's CbCr plane offset)
+    int      wb_pending_index = -1;
 
     int _ready_to_write = 0;
 
     MppEncoder    encoder;
-    OsdCompositor osd;
     Mp4Writer     writer;
 
     std::string current_filename;
 
     uint32_t frames_submitted = 0;
-    uint32_t frames_written   = 0;
-    uint32_t consecutive_write_failures = 0;  // resets on any successful NAL write; drives fail-stop
-    std::queue<int64_t> submitted_pts;   // FIFO of submitted frame PTS (ms), in encode order
-    int64_t  last_written_pts = -1;      // PTS (ms) of last frame written to the MP4
+    uint32_t frames_written   = 0;   // frames handed to the writer (enqueued), not yet on disk
+    struct FrameStamp { int64_t pts; uint64_t seq; };
+    std::queue<FrameStamp> submitted_pts; // FIFO of submitted frame {pts, seq}, encode order
+    int64_t  rec_start_pts = -1;         // feed-pts (ms) of the first frame of the current segment
+    int      last_good_duration = 0;     // last computed duration (90k ticks); fallback
 };
 
 #endif

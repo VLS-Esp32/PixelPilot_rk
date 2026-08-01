@@ -38,6 +38,10 @@ uint64_t StorageGuard::file_size_cap() const {
     return 0; // large-file filesystem (ext4, exFAT, ...) - no cap needed
 }
 
+bool StorageGuard::mount_ok() const {
+    return !require_mount || is_external_mount();
+}
+
 bool StorageGuard::is_ready(std::string &reason) const {
     if (require_mount && !is_external_mount()) {
         reason = "storage not mounted at " + recording_dir;

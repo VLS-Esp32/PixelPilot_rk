@@ -1,5 +1,8 @@
 #include <pthread.h>
+#include <poll.h>
+#include <unistd.h>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -24,17 +27,20 @@ int dvr_enabled = 0;
 
 static const int SEQUENCE_PADDING = 4;   // zero-padding width for sequence-numbered filenames
 
-// Max RPC_FRAME entries allowed to sit in the queue before new frames are dropped.
-// The decoder recycles its buffer pool (MAX_FRAMES) soon after a frame is enqueued and
-// we only carry the prime_fd, so a deep backlog would composite recycled (wrong) buffers.
+// Max RPC_FRAME entries allowed to sit in the queue before new frames are dropped. Keeps the DVR
+// current: in VideoOnly we carry only the decoder's prime_fd, which the decoder recycles (its
+// MAX_FRAMES pool) soon after we enqueue, so a deep backlog would encode a recycled (wrong) buffer.
 // Keeping this small bounds DVR lateness to a few frames, well inside the recycle window.
 static const size_t DVR_MAX_PENDING_FRAMES = 3;
 
 static const int MP4_TIMEBASE_90K = 90000;  // minimp4 timescale (ticks per second)
 static const int MS_TO_90K        = 90;     // 1 ms = 90 ticks at 90kHz
 
-static const uint32_t FPS_MIN_FRAMES = 30;
-static const int64_t  FPS_MIN_PERIOD_MS = 500;
+// Cap on a single frame's MP4 duration (90k ticks). A drop burst (e.g. frames lost while the DVR
+// thread blocks on segment rotation) inflates seq_delta; without this cap the resulting frame would
+// be held for seconds - a freeze. 0.25s is far above any real inter-frame gap, so normal frames are
+// unaffected; it only bounds the pathological case.
+static const int MAX_FRAME_DURATION_90K = MP4_TIMEBASE_90K / 4;
 
 //Periodic storage guard check runs during recording (free-space / mount check).
 static const int64_t  STORAGE_CHECK_INTERVAL_MS = 3000;
@@ -42,21 +48,15 @@ static const int64_t  STORAGE_CHECK_INTERVAL_MS = 3000;
 // Consecutive failed frame writes (disk full / I/O error) before we fail-stop the recording.
 static const uint32_t MAX_CONSECUTIVE_WRITE_FAILURES = 5;
 
+// Max wait for the DRM writeback capture fence to signal (the VOP finished writing the composited
+// frame into the WB buffer). A timeout means something is wrong; we drop that frame rather than
+// encode a half-written buffer.
+static const int WB_FENCE_TIMEOUT_MS = 200;
+
 static int64_t monotonic_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-// Round a measured fps to the closest standard fps rate (e.g. 30, 60) for a clean GOP
-static int round_to_standard_fps(int fps) {
-    static const int common[] = {24, 25, 30, 48, 50, 60, 90, 120};
-    for (int c : common) {
-        if (fps >= c - 2 && fps <= c + 2) {
-            return c;
-        }
-    }
-    return fps;
 }
 
 Dvr::Dvr(dvr_thread_params params)
@@ -67,53 +67,71 @@ Dvr::Dvr(dvr_thread_params params)
     dvr_filenames_with_sequence = params.dvr_filenames_with_sequence;
     dvr_bitrate                 = params.dvr_bitrate;
     segment_limit_ms            = (int64_t)params.dvr_segment_minutes * 60 * 1000;
-    mode = params.enable_osd_in_dvr ? RecordingMode::VideoWithOsd : RecordingMode::VideoOnly;
+    if (params.enable_osd_in_dvr && params.enable_wb) {
+        // Record the display's composited output (video+OSD) captured via DRM writeback.
+        mode = RecordingMode::VideoWithOsdWriteback;
+        wb_nv12           = params.wb_nv12;
+        wb_enc_width      = params.wb_width;
+        wb_enc_height     = params.wb_height;
+        wb_enc_hor_stride = params.wb_hor_stride_bytes;
+        wb_enc_ver_stride = params.wb_ver_stride;
+    } else {
+        if (params.enable_osd_in_dvr) {
+            spdlog::warn("[ DVR ] OSD-in-DVR requested but writeback unavailable — recording clean video (no OSD)");
+        }
+        mode = RecordingMode::VideoOnly;
+    }
 
     video_frm_width  = params.video_p.video_frm_width;
     video_frm_height = params.video_p.video_frm_height;
-    // Recording resolution - display resolution when available, otherwise native video.
-    disp_width  = (params.display_width  > 0) ? params.display_width  : params.video_p.video_frm_width;
-    disp_height = (params.display_height > 0) ? params.display_height : params.video_p.video_frm_height;
+    enc_fps = params.display_fps > 0 ? (int)params.display_fps : 60;
 }
 
 Dvr::~Dvr() {}
 
-void Dvr::frame(dvr_frame_info info) {
-    if (fps_measure_first_pts < 0) {
-        fps_measure_first_pts = (int64_t)info.pts;
-        fps_measure_count = 0;
-    }
-
-    fps_measure_count++;
-    int64_t period_ms = (int64_t)info.pts - fps_measure_first_pts;
-    if (fps_measure_count >= FPS_MIN_FRAMES && period_ms >= FPS_MIN_PERIOD_MS) {
-        int fps = (int)(((int64_t)(fps_measure_count - 1) * 1000 + period_ms / 2) / period_ms);
-        if (fps < 1) {
-            fps = 1;
-        }
-        if (fps > 120) {
-            fps = 120;
-        }
-        detected_fps.store(round_to_standard_fps(fps));
-        // Reset the window so the estimate keeps tracking the stream.
-        fps_measure_first_pts = (int64_t)info.pts;
-        fps_measure_count = 0;
-    }
-
-    // Backpressure - we carry only the decoder buffer's prime_fd, and the decoder recycles
-    // that buffer (MAX_FRAMES pool) shortly after we enqueue. If the encode pipeline falls
-    // behind (e.g. OSD blend can't sustain 60fps), a backlogged frame's fd gets reused for a
-    // newer decoded frame before we composite it -> we'd read the wrong (jumped-ahead)
-    // content and the queue would only grow. Cap the backlog so the DVR always processes
-    // recent frames; dropped frames are absorbed by the real-PTS frame durations.
+void Dvr::writeback_frame(dvr_frame_info info) {
+    bool dropped = false;
     {
         std::lock_guard<std::mutex> lock(mtx);
         if (dvrQueue.size() >= DVR_MAX_PENDING_FRAMES) {
-            return; // pipeline behind — drop this frame to stay current
+            dropped = true;
+        } else {
+            dvrQueue.push({ .command = dvr_rpc::RPC_FRAME, .frame_info = info });
+        }
+    }
+    if (dropped) {
+        if (info.fence_fd >= 0) {
+            close(info.fence_fd);
+        }
+        pp_wb_release(info.wb_index);
+        return;
+    }
+    cv.notify_one();
+}
+
+void Dvr::frame(dvr_frame_info info) {
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (dvrQueue.size() >= DVR_MAX_PENDING_FRAMES) {
+            return; // backlog full — drop this frame to stay current
         }
         dvrQueue.push({ .command = dvr_rpc::RPC_FRAME, .frame_info = info });
     }
     cv.notify_one();
+}
+
+// Release the writeback resources a frame carries (capture fence + pool slot). No-op for the
+// decode-tap paths, whose frames have fence_fd/wb_index == -1. Must be called for every writeback
+// frame that does NOT reach encode_and_write_wb(), or the display thread's pool starves.
+static inline void release_wb_frame(dvr_frame_info &fi) {
+    if (fi.fence_fd >= 0) {
+        close(fi.fence_fd);
+        fi.fence_fd = -1;
+    }
+    if (fi.wb_index >= 0) {
+        pp_wb_release(fi.wb_index);
+        fi.wb_index = -1;
+    }
 }
 
 void Dvr::drop_pending_frames() {
@@ -121,6 +139,8 @@ void Dvr::drop_pending_frames() {
     while (!dvrQueue.empty()) {
         if (dvrQueue.front().command != dvr_rpc::RPC_FRAME) {
             kept.push(dvrQueue.front());
+        } else {
+            release_wb_frame(dvrQueue.front().frame_info); // free WB slot/fence of discarded frames
         }
         dvrQueue.pop();
     }
@@ -132,18 +152,12 @@ void Dvr::set_video_params(uint32_t video_frm_w, uint32_t video_frm_h) {
     video_frm_width = video_frm_w;
     video_frm_height = video_frm_h;
     drop_pending_frames();
-
-    fps_measure_first_pts = -1;
-    fps_measure_count = 0;
 }
 
 void Dvr::restart() {
     {
         std::lock_guard<std::mutex> lock(mtx);
         drop_pending_frames();
-        fps_measure_first_pts = -1;
-        fps_measure_count = 0;
-        detected_fps.store(0);
         dvrQueue.push({ .command = dvr_rpc::RPC_SET_PARAMS });
     }
     cv.notify_one();
@@ -225,18 +239,27 @@ void Dvr::loop() {
             }
             break;
         case dvr_rpc::RPC_FRAME: {
-            int64_t pts = (int64_t)rpc.frame_info.pts;
-
-            // Periodic storage guard check: fail-stop if the mount vanished or free
-            // space dropped below the threshold.
+            // Periodic storage guard check: fail-stop if the mount vanished or free space
+            // dropped below the threshold. Uses an I/O-free estimate (free-at-start minus bytes
+            // written) rather than statvfs, which on a busy FAT32 card stalls 100ms+ and would
+            // stutter the recording. True disk-full is still caught by the write-failure fail-stop.
             if (_ready_to_write) {
                 int64_t now_ms = monotonic_ms();
                 if (now_ms - last_storage_check_ms >= STORAGE_CHECK_INTERVAL_MS) {
                     last_storage_check_ms = now_ms;
-                    std::string reason;
-                    if (!storage.is_ready(reason)) {
-                        spdlog::warn("[ DVR ] {}, stopping recording", reason);
+                    uint64_t written = writer.size();
+                    uint64_t est_free = session_free_at_start > written ? session_free_at_start - written : 0;
+                    if (!storage.mount_ok()) {
+                        spdlog::warn("[ DVR ] storage no longer mounted, stopping recording");
                         stop();
+                        release_wb_frame(rpc.frame_info);
+                        break;
+                    }
+                    if (!storage.has_enough_free(est_free)) {
+                        spdlog::warn("[ DVR ] low free space (~{}MB left, need {}MB), stopping recording",
+                                     est_free / (1024 * 1024), storage.min_free() / (1024 * 1024));
+                        stop();
+                        release_wb_frame(rpc.frame_info);
                         break;
                     }
                 }
@@ -248,31 +271,30 @@ void Dvr::loop() {
                 rotate_recording_file();
             }
 
-            if (_ready_to_write && segment_limit_ms > 0 && segment_start_pts >= 0 &&
-                pts - segment_start_pts >= segment_limit_ms) {
+            if (_ready_to_write && segment_limit_ms > 0 &&
+                segment_video_ticks >= segment_limit_ms * MS_TO_90K) {
                 spdlog::info("[ DVR ] segment time limit reached, starting new file");
                 rotate_recording_file();
             }
             if (!_ready_to_write) {
-                if (writer.is_open() && video_frm_width > 0 && video_frm_height > 0 &&
-                    detected_fps.load() > 0) {
+                if (writer.is_open() && video_frm_width > 0 && video_frm_height > 0) {
                     init();
                 }
                 if (!_ready_to_write) {
-                    spdlog::debug("[ DVR ] RPC_FRAME: _ready_to_write=0 measuring fps, fps={}), skipping",
-                                  detected_fps.load());
-                    break; // awaiting fps - drop this frame
+                    spdlog::debug("[ DVR ] RPC_FRAME: encoder not ready (awaiting video params), skipping");
+                    release_wb_frame(rpc.frame_info);
+                    break;
                 }
-            }
-            if (segment_start_pts < 0) {
-                segment_start_pts = pts;
             }
             encode_and_write(rpc.frame_info);
 
-            if (consecutive_write_failures >= MAX_CONSECUTIVE_WRITE_FAILURES) {
-                spdlog::error("[ DVR ] {} consecutive write failures (disk full or I/O error), stopping recording",
-                              consecutive_write_failures);
-                stop();
+            {
+                uint32_t fails = writer.consecutive_write_failures();
+                if (fails >= MAX_CONSECUTIVE_WRITE_FAILURES) {
+                    spdlog::error("[ DVR ] {} consecutive write failures (disk full or I/O error), stopping recording",
+                                  fails);
+                    stop();
+                }
             }
             break;
         }
@@ -343,14 +365,14 @@ int Dvr::start() {
     current_filename = mp4_filename;
 
     max_file_bytes = storage.file_size_cap();
+    session_free_at_start = storage.free_bytes(); // one statvfs; mid-recording checks estimate from this
     spdlog::info("[ DVR ] storage: {}MB free, per-file cap {}MB",
-                 storage.free_bytes() / (1024 * 1024),
+                 session_free_at_start / (1024 * 1024),
                  max_file_bytes / (1024 * 1024));
 
     frames_submitted = 0;
     frames_written   = 0;
-    consecutive_write_failures = 0;
-    last_written_pts = -1;
+    rec_start_pts    = -1;   // re-anchor the video clock on this segment's first frame
     while (!submitted_pts.empty()) {
         submitted_pts.pop();
     }
@@ -361,33 +383,33 @@ int Dvr::start() {
 }
 
 void Dvr::init() {
-    int fps = detected_fps.load();
+    int fps = enc_fps;
     if (video_frm_width == 0 || video_frm_height == 0 || fps <= 0) {
         spdlog::warn("[ DVR ] invalid video params {}x{} @{}",
                      video_frm_width, video_frm_height, fps);
         return;
     }
 
-    // Tear down any previous encoder/compositor (re-init on resolution change).
+
+    // Tear down any previous encoder (re-init on resolution change).
     _ready_to_write = 0;
     encoder.cleanup();
-    osd.cleanup();
 
     int enc_w, enc_h, enc_hor, enc_ver, mp4_w, mp4_h;
-    if (mode == RecordingMode::VideoWithOsd) {
-        if (!osd.init((int)disp_width, (int)disp_height,
-            (int)video_frm_width, (int)video_frm_height)) {
-            return;
-        }
-        enc_w = (int)disp_width; 
-        enc_h = (int)disp_height;
-        enc_hor = osd.get_enc_hor_stride(); 
-        enc_ver = osd.get_enc_ver_stride();
-        mp4_w = (int)disp_width;
-        mp4_h = (int)disp_height;
-        spdlog::info("[ DVR ] setting up dvr encoder {}x{} (video {}x{}) @{}fps bitrate={} H265 [OSD+RGA]",
-                     disp_width, disp_height, video_frm_width, video_frm_height,
-                     fps, dvr_bitrate);
+    MppFrameFormat enc_format;
+    if (mode == RecordingMode::VideoWithOsdWriteback) {
+        // The display thread captures the composited output (video + OSD) the VOP wrote into the
+        // writeback buffers at display resolution. Encoder geometry is fixed to those buffers;
+        // NV12 goes to the encoder natively, a packed RGB format is HW-converted.
+        enc_w = (int)wb_enc_width;
+        enc_h = (int)wb_enc_height;
+        enc_hor = (int)wb_enc_hor_stride;
+        enc_ver = (int)wb_enc_ver_stride;
+        mp4_w = (int)wb_enc_width;
+        mp4_h = (int)wb_enc_height;
+        enc_format = wb_nv12 ? MPP_FMT_YUV420SP : MPP_FMT_BGRA8888;
+        spdlog::info("[ DVR ] setting up dvr encoder {}x{} @{}fps bitrate={} H265 [writeback WYSIWYG, {} in]",
+                     wb_enc_width, wb_enc_height, fps, dvr_bitrate, wb_nv12 ? "NV12" : "BGRA");
     }
     else {
         enc_w = (int)video_frm_width;
@@ -396,18 +418,17 @@ void Dvr::init() {
         enc_ver = (int)((video_frm_height + 15) & ~15u);
         mp4_w = (int)video_frm_width;
         mp4_h = (int)video_frm_height;
+        enc_format = MPP_FMT_YUV420SP;
         spdlog::info("[ DVR ] setting up dvr encoder {}x{} @{}fps bitrate={} H265 [zero-copy]",
                      video_frm_width, video_frm_height, fps, dvr_bitrate);
     }
 
-    if (!encoder.init(enc_w, enc_h, enc_hor, enc_ver, fps, dvr_bitrate)) {
-        osd.cleanup();
+    if (!encoder.init(enc_w, enc_h, enc_hor, enc_ver, fps, dvr_bitrate, enc_format)) {
         return;
     }
 
     if (!writer.begin_video(mp4_w, mp4_h)) {
         encoder.cleanup();
-        osd.cleanup();
         return;
     }
 
@@ -416,27 +437,28 @@ void Dvr::init() {
 }
 
 int Dvr::next_frame_duration() {
-    // Duration (in 90kHz MP4 ticks) for the next frame written to the MP4, derived from the
-    // real wall-clock PTS delta between consecutive frames. This makes the recorded duration
-    // match real time regardless of the actual capture rate or any dropped frames — unlike a
-    // fixed 90000/fps, which fast-forwards when fewer frames are produced than the nominal
-    // rate (and slows down when more are). PTS is in ms; 1ms = 90 ticks at 90kHz. The first
-    // frame and any implausible delta fall back to the nominal 1/fps duration. Packets are
-    // emitted in submission order (IPPP, no B-frames), so the FIFO front always matches the
-    // packet being written.
-    int duration = MP4_TIMEBASE_90K / detected_fps.load();
-    if (!submitted_pts.empty()) {
-        int64_t pts = submitted_pts.front();
-        submitted_pts.pop();
-        if (last_written_pts >= 0) {
-            int64_t delta = pts - last_written_pts;
-            if (delta > 0 && delta < 10000) { // sane gap: < 10s between frames
-                duration = (int)(delta * MS_TO_90K);
-            }
-        }
-        last_written_pts = pts;
+    if (submitted_pts.empty()) {
+        int d = last_good_duration > 0 ? last_good_duration : (MP4_TIMEBASE_90K / enc_fps);
+        segment_video_ticks += d;
+        return d;
     }
-    return duration;
+    int64_t pts = submitted_pts.front().pts;
+    submitted_pts.pop();
+
+    if (rec_start_pts < 0) {
+        rec_start_pts = pts;   // anchor the segment on its first frame
+    }
+    int64_t target   = (pts - rec_start_pts) * MS_TO_90K;   // real elapsed since segment start (ticks)
+    int64_t duration = target - segment_video_ticks;         // close the drift to real time
+    if (duration < 1) {
+        duration = 1;   // MP4 sample durations must be positive
+    }
+    if (duration > MAX_FRAME_DURATION_90K) {
+        duration = MAX_FRAME_DURATION_90K;
+    }
+    last_good_duration = (int)duration;
+    segment_video_ticks += duration;
+    return (int)duration;
 }
 
 MppBuffer Dvr::import_decoder_buffer(const dvr_frame_info &info) {
@@ -455,53 +477,86 @@ MppBuffer Dvr::import_decoder_buffer(const dvr_frame_info &info) {
     return dec_buf;
 }
 
-void Dvr::encode_and_write(dvr_frame_info info) {
-    if (!encoder.ready() || !_ready_to_write) {
-        spdlog::warn("[ DVR ] encode_and_write skipped — encoder not ready");
-        return;
+void Dvr::encode_and_write_wb(dvr_frame_info info) {
+    // 1) Wait for the VOP to finish writing the composited frame into this WB buffer.
+    if (info.fence_fd >= 0) {
+        struct pollfd pfd = { info.fence_fd, POLLIN, 0 };
+        int pr = poll(&pfd, 1, WB_FENCE_TIMEOUT_MS);
+        close(info.fence_fd);
+        if (pr <= 0) {
+            spdlog::warn("[ DVR ] writeback fence wait failed/timed out ({}), dropping frame", pr);
+            pp_wb_release(info.wb_index);
+            return;
+        }
     }
 
-    // Write any packets produced by the previous submission (it has had a full frame
-    // interval to complete).
+    // 2) Drain the previous submission (the encoder reads a frame for one more cycle - IPPP
+    //    latency, same as the VideoOnly path). After the drain MPP is done with the previous WB
+    //    buffer, so release that pool slot back to the display thread.
     encoder.drain([this](const uint8_t *data, int len) {
         if (writer.write_nal(data, len, next_frame_duration())) {
             frames_written++;
-            consecutive_write_failures = 0;
-        } else {
-            consecutive_write_failures++;
+        }
+    });
+    if (wb_pending_index >= 0) {
+        pp_wb_release(wb_pending_index);
+        wb_pending_index = -1;
+    }
+
+    // 3) Import & submit the freshly-composited buffer; hold its slot until the next drain.
+    MppBuffer buf = import_decoder_buffer(info);
+    if (!buf) {
+        pp_wb_release(info.wb_index);
+        return;
+    }
+    int ret = encoder.submit(buf, (int64_t)info.pts,
+                             (int)wb_enc_width, (int)wb_enc_height,
+                             (int)wb_enc_hor_stride, (int)wb_enc_ver_stride);
+    mpp_buffer_put(buf); // encoder holds its own ref; release our import ref
+    if (ret == 0) {
+        submitted_pts.push({ (int64_t)info.pts, info.frame_seq });
+        frames_submitted++;
+        wb_pending_index = info.wb_index;
+    } else {
+        pp_wb_release(info.wb_index);
+    }
+}
+
+void Dvr::encode_and_write(dvr_frame_info info) {
+    if (!encoder.ready() || !_ready_to_write) {
+        spdlog::warn("[ DVR ] encode_and_write skipped — encoder not ready");
+        release_wb_frame(info); // no-op for decode-tap modes
+        return;
+    }
+
+    if (mode == RecordingMode::VideoWithOsdWriteback) {
+        encode_and_write_wb(info);
+        return;
+    }
+
+    // VideoOnly: zero-copy, done inline on this thread (drain previous output, import, submit).
+    encoder.drain([this](const uint8_t *data, int len) {
+        if (writer.write_nal(data, len, next_frame_duration())) {
+            frames_written++;
         }
     });
 
-    if (mode == RecordingMode::VideoWithOsd) {
-        MppBuffer buf = osd.compose(info);
-        if (!buf) {
-            return;
-        }
-        if (encoder.submit(buf, (int64_t)info.pts,
-                           osd.get_disp_width(), osd.get_disp_height(),
-                           osd.get_enc_hor_stride(), osd.get_enc_ver_stride()) == 0) {
-            submitted_pts.push((int64_t)info.pts);
-            frames_submitted++;
-        }
+    // Sync encoder config strides to actual decoded frame strides
+    if ((int)info.hor_stride != encoder.get_hor_stride() || (int)info.ver_stride != encoder.get_ver_stride()) {
+        encoder.sync_strides((int)info.hor_stride, (int)info.ver_stride);
     }
-    else {
-        // Sync encoder config strides to actual decoded frame strides
-        if ((int)info.hor_stride != encoder.get_hor_stride() || (int)info.ver_stride != encoder.get_ver_stride()) {
-            encoder.sync_strides((int)info.hor_stride, (int)info.ver_stride);
-        }
 
-        MppBuffer buf = import_decoder_buffer(info);
-        if (!buf) {
-            return;
-        }
-        int ret = encoder.submit(buf, (int64_t)info.pts,
-                                 (int)info.width, (int)info.height,
-                                 (int)info.hor_stride, (int)info.ver_stride);
-        mpp_buffer_put(buf); // encoder holds its own ref; release ours
-        if (ret == 0) {
-            submitted_pts.push((int64_t)info.pts);
-            frames_submitted++;
-        }
+    MppBuffer buf = import_decoder_buffer(info);
+    if (!buf) {
+        return;
+    }
+    int ret = encoder.submit(buf, (int64_t)info.pts,
+                             (int)info.width, (int)info.height,
+                             (int)info.hor_stride, (int)info.ver_stride);
+    mpp_buffer_put(buf); // encoder holds its own ref; release ours
+    if (ret == 0) {
+        submitted_pts.push({ (int64_t)info.pts, info.frame_seq });
+        frames_submitted++;
     }
 }
 
@@ -524,8 +579,16 @@ void Dvr::finalize_current_file() {
         });
     }
 
+    // Writeback mode: the last submitted buffer has now been drained/flushed, so release its slot.
+    if (wb_pending_index >= 0) {
+        pp_wb_release(wb_pending_index);
+        wb_pending_index = -1;
+    }
+
+    spdlog::info("[ DVR ] recording finalized: {} frames, {:.1f}s",
+                 frames_written, segment_video_ticks / 90000.0);
+
     encoder.cleanup();
-    osd.cleanup();
 
     bool empty = (frames_written == 0);
     bool finalized_ok = writer.close();
@@ -546,7 +609,7 @@ void Dvr::finalize_current_file() {
         }
     }
     current_filename.clear();
-    segment_start_pts = -1;
+    segment_video_ticks = 0;
 }
 
 void Dvr::stop() {

@@ -166,6 +166,23 @@ Dvr *dvr = NULL;
 int dvr_autostart = 0;
 int signal_flag = 0;
 
+// --- DVR writeback (WYSIWYG) capture pool ---
+// The VOP writes the composited display output (video + OSD planes) into these NV12 buffers, which
+// cycle between the display thread (producer) and the DVR thread (consumer). Sized one deeper than
+// the DVR's queue cap so one frame can be mid-encode while the queue is full without the display
+// finding no free buffer.
+#define WB_BUF_COUNT 4
+static struct modeset_buf wb_bufs[WB_BUF_COUNT];
+static std::atomic<bool>  wb_busy[WB_BUF_COUNT];
+static bool dvr_wb_mode = false;   // writeback available AND selected for this run
+
+// Called by the DVR thread once it has finished encoding writeback buffer `index`.
+void pp_wb_release(int index) {
+    if (index >= 0 && index < WB_BUF_COUNT) {
+        wb_busy[index].store(false, std::memory_order_release);
+    }
+}
+
 void init_buffer(MppFrame frame) {
 	uint32_t prev_frm_width = output_list->video_frm_width;
 	uint32_t prev_frm_height = output_list->video_frm_height;
@@ -360,19 +377,26 @@ void *__FRAME_THREAD__(void *param)
 
 					ts = ats;
 
+                    // one per decoded frame, incl. those the DVR drops; the writeback path reads
+                    // this back on the display thread for jitter-free duration pacing.
+                    static uint64_t dvr_decoded_frame_seq = 0;
+                    dvr_decoded_frame_seq++;
+
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
 					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
                     //output_list->video_fb_index=i;
                     output_list->decoding_pts=feed_data_ts;
+                    output_list->decoding_frame_seq = dvr_decoded_frame_seq;
 					ret = pthread_cond_signal(&video_cond);
 					assert(!ret);
 					ret = pthread_mutex_unlock(&video_mutex);
 					assert(!ret);
 
-                    // send decoded frame to DVR for re-encoding
-                    if (dvr_enabled && dvr != NULL) {
+                    // Decode-tap DVR (VideoOnly) is fed here. Writeback mode taps the composited
+                    // output on the display thread instead, so skip it here.
+                    if (dvr_enabled && dvr != NULL && !dvr_wb_mode) {
                         dvr_frame_info dfi;
                         dfi.prime_fd   = mpi.frame_to_drm[i].prime_fd;
                         dfi.width      = output_list->video_frm_width;
@@ -381,6 +405,7 @@ void *__FRAME_THREAD__(void *param)
                         dfi.ver_stride = mpp_frame_get_ver_stride(frame);
                         dfi.buf_size   = dfi.hor_stride * dfi.ver_stride * 2;
                         dfi.pts        = feed_data_ts;
+                        dfi.frame_seq  = dvr_decoded_frame_seq;
                         dvr->frame(dfi);
                     }
 
@@ -421,6 +446,7 @@ void *__DISPLAY_THREAD__(void *param)
 		osd_update = osd_update_ready;
 
         uint64_t decoding_pts=fb_id != 0 ? output_list->decoding_pts : get_time_ms();
+        uint64_t decoding_seq = output_list->decoding_frame_seq; // for writeback duration pacing
 		output_list->video_fb_id=0;
 		osd_update_ready = false;
 		ret = pthread_mutex_unlock(&video_mutex);
@@ -443,10 +469,80 @@ void *__DISPLAY_THREAD__(void *param)
         ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
         assert(ret>0);
 
-        drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
+        // DVR writeback (WYSIWYG) capture management. While recording, every displayed video frame
+        // is captured into a free pool buffer by (re)attaching the writeback connector with a fresh
+        // FB. A writeback connector attached to the CRTC but without a framebuffer FAILS the atomic
+        // check, so on any commit that does NOT capture we must detach it (CRTC_ID=0). We never
+        // block the display on the DVR: if no pool buffer is free we skip capture for this frame.
+        // wb_arm_disabled latches writeback off if commits keep failing, so a broken writeback path
+        // can never freeze the live display.
+        static bool wb_attached = false;
+        static int  wb_commit_fails = 0;
+        static bool wb_arm_disabled = false;
+        int     wb_idx = -1;
+        int32_t wb_out_fence = -1;
+        bool    want_capture = dvr_wb_mode && !wb_arm_disabled && dvr_enabled && dvr != NULL && fb_id != 0;
+        if (want_capture) {
+            for (int i = 0; i < WB_BUF_COUNT; i++) {
+                bool expected = false;
+                if (wb_busy[i].compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                    wb_idx = i;
+                    break;
+                }
+            }
+            if (wb_idx >= 0) {
+                if (modeset_add_writeback(output_list, output_list->video_request,
+                                          wb_bufs[wb_idx].fb, &wb_out_fence) < 0) {
+                    wb_busy[wb_idx].store(false, std::memory_order_release);
+                    wb_idx = -1;
+                } else {
+                    flags = DRM_MODE_ATOMIC_ALLOW_MODESET;   // (re)attaching may count as a modeset
+                    wb_attached = true;
+                }
+            }
+        }
+        if (wb_idx < 0 && wb_attached) {
+            // Not capturing this commit — detach the writeback connector so the atomic check passes.
+            set_drm_object_property(output_list->video_request, &output_list->wb_connector, "CRTC_ID", 0);
+            flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
+            wb_attached = false;
+        }
+
+        int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
 
         ret = pthread_mutex_unlock(&osd_mutex);
         assert(!ret);
+
+        // Hand the captured frame to the DVR once the commit populated the out fence (the DVR
+        // thread waits on it before encoding). On commit failure, reclaim the buffer/fence and,
+        // after repeated failures, latch writeback off to keep the display alive.
+        if (wb_idx >= 0) {
+            if (commit_ret == 0) {
+                wb_commit_fails = 0;
+                dvr_frame_info dfi{};
+                dfi.prime_fd   = wb_bufs[wb_idx].prime_fd;
+                dfi.width      = wb_bufs[wb_idx].width;
+                dfi.height     = wb_bufs[wb_idx].height;
+                dfi.hor_stride = wb_bufs[wb_idx].stride;
+                dfi.ver_stride = wb_bufs[wb_idx].height;
+                dfi.buf_size   = wb_bufs[wb_idx].size;
+                dfi.pts        = decoding_pts;
+                dfi.frame_seq  = decoding_seq;
+                dfi.fence_fd   = wb_out_fence;
+                dfi.wb_index   = wb_idx;
+                dvr->writeback_frame(dfi);
+            } else {
+                if (wb_out_fence >= 0) {
+                    close(wb_out_fence);
+                }
+                wb_busy[wb_idx].store(false, std::memory_order_release);
+                wb_attached = false;
+                if (++wb_commit_fails >= 3) {
+                    wb_arm_disabled = true;
+                    spdlog::error("[ DVR ] writeback commits keep failing — disabling writeback capture (display preserved)");
+                }
+            }
+        }
 
         if (enable_osd && fb_id != 0) {
             osd_publish_uint_fact("video.displayed_frame", NULL, 0, 1);
@@ -662,8 +758,43 @@ int setup_drm(int print_modelist, uint16_t mode_width, uint16_t mode_height, uin
 	return 1;
 }
 
+static bool setup_writeback()
+{
+	if (modeset_find_writeback(drm_fd, output_list) != 0) {
+		spdlog::info("[ DVR ] no DRM writeback connector — OSD-in-DVR will record clean video");
+		return false;
+	}
+	for (int i = 0; i < WB_BUF_COUNT; i++) {
+		wb_bufs[i].width  = output_list->mode.hdisplay;
+		wb_bufs[i].height = output_list->mode.vdisplay;
+		if (modeset_create_wb_fb(drm_fd, &wb_bufs[i], output_list->wb_fourcc) != 0) {
+			spdlog::error("[ DVR ] failed to allocate writeback buffer {} — recording clean video", i);
+			for (int j = 0; j < i; j++) {
+				modeset_destroy_wb_fb(drm_fd, &wb_bufs[j]);
+			}
+			return false;
+		}
+		wb_busy[i].store(false);
+	}
+	spdlog::info("[ DVR ] writeback WYSIWYG capture enabled: {}x{}, {} buffers, format {}",
+		     output_list->mode.hdisplay, output_list->mode.vdisplay, WB_BUF_COUNT,
+		     output_list->wb_fourcc == DRM_FORMAT_NV12 ? "NV12" : "RGB");
+	return true;
+}
+
+static void cleanup_writeback()
+{
+	if (!dvr_wb_mode) {
+		return;
+	}
+	for (int i = 0; i < WB_BUF_COUNT; i++) {
+		modeset_destroy_wb_fb(drm_fd, &wb_bufs[i]);
+	}
+}
+
 void cleanup_drm()
 {
+	cleanup_writeback();
 	restore_planes_zpos(drm_fd, output_list);
 	drmModeSetCrtc(drm_fd,
 			       output_list->saved_crtc->crtc_id,
@@ -851,7 +982,7 @@ void printHelp() {
     "\n"
     "    --dvr-fmp4                - Save the video feed as a fragmented mp4\n"
     "\n"
-    "    --dvr-osd                 - Burn OSD into DVR recording via RGA hardware blending\n"
+    "    --dvr-osd                 - Burn OSD into DVR recording (WYSIWYG via DRM writeback)\n"
     "\n"
     "    --dvr-bitrate <bps>       - Target bitrate for DVR re-encoding (Default: 8000000)\n"
     "\n"
@@ -1191,6 +1322,11 @@ int main(int argc, char **argv)
 
 	pthread_t tid_display, tid_osd, tid_mavlink, tid_dvr, tid_wfbcli;
 	if (dvr_template != NULL) {
+		// When OSD-in-DVR is requested, use WYSIWYG writeback capture if the display supports it;
+		// otherwise the DVR records clean video (no OSD).
+		if (dvr_enable_osd) {
+			dvr_wb_mode = setup_writeback();
+		}
 		dvr_thread_params args;
 		args.filename_template = dvr_template;
 		args.mp4_fragmentation_mode = mp4_fragmentation_mode;
@@ -1202,6 +1338,15 @@ int main(int argc, char **argv)
         args.dvr_require_mount = dvr_require_mount;
         args.display_width  = output_list->mode.hdisplay;
         args.display_height = output_list->mode.vdisplay;
+        args.display_fps    = output_list->mode.vrefresh;
+        args.enable_wb = dvr_wb_mode;
+        if (dvr_wb_mode) {
+            args.wb_nv12 = (output_list->wb_fourcc == DRM_FORMAT_NV12);
+            args.wb_width  = output_list->mode.hdisplay;
+            args.wb_height = output_list->mode.vdisplay;
+            args.wb_hor_stride_bytes = wb_bufs[0].stride;              // Y stride (NV12) / BGRA stride
+            args.wb_ver_stride = (output_list->mode.vdisplay + 15) & ~15u; // matches modeset_create_wb_fb
+        }
 		args.video_p.video_frm_width = output_list->video_frm_width;
 		args.video_p.video_frm_height = output_list->video_frm_height;
 		dvr = new Dvr(args);

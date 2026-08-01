@@ -70,7 +70,16 @@ struct modeset_output {
 
     // Used to calculate latency
     uint64_t decoding_pts;
+	// decode sequence of the frame currently in video_fb_id, paired with decoding_pts. Published
+	// by the decode thread for the DVR writeback path (jitter-free duration pacing).
+	uint64_t decoding_frame_seq;
 	int video_poc;
+
+	// Writeback connector for DVR WYSIWYG capture (optional, probed at runtime). Captures the
+	// display's composited CRTC output (video + OSD) into a dmabuf, preferably as NV12.
+	struct drm_object wb_connector;
+	bool wb_available;
+	uint32_t wb_fourcc;   // chosen writeback output DRM fourcc (NV12 preferred, else ARGB8888)
 
 	bool cleanup;
 };
@@ -99,6 +108,14 @@ void modeset_destroy_objects(int fd, struct modeset_output *out);
 int modeset_create_fb(int fd, struct modeset_buf *buf);
 
 void modeset_destroy_fb(int fd, struct modeset_buf *buf);
+
+int modeset_find_writeback(int fd, struct modeset_output *out);
+
+int modeset_create_wb_fb(int fd, struct modeset_buf *buf, uint32_t fourcc);
+
+void modeset_destroy_wb_fb(int fd, struct modeset_buf *buf);
+
+int modeset_add_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr);
 
 int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_output *out);
 

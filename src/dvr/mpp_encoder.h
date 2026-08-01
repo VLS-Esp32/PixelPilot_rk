@@ -8,8 +8,10 @@
 
 class MppEncoder {
 public:
-    // Configure an H265 encoder for the given input geometry
-    bool init(int width, int height, int hor_stride, int ver_stride, int fps, int bitrate);
+    // Configure an H265 encoder for the given input geometry and pixel format. `hor_stride` is
+    // in the format's native units (pixels for NV12, bytes for RGB/BGRA). Defaults to NV12.
+    bool init(int width, int height, int hor_stride, int ver_stride, int fps, int bitrate,
+              MppFrameFormat format = MPP_FMT_YUV420SP);
 
     // Re-publish input strides at runtime — the zero-copy decoder may align its
     // buffers differently than the estimate used at init().
@@ -31,6 +33,7 @@ private:
     MppEncCfg cfg = nullptr;
     int cfg_hor_stride = 0;
     int cfg_ver_stride = 0;
+    MppFrameFormat cfg_format = MPP_FMT_YUV420SP;
 };
 
 #endif

@@ -18,6 +18,14 @@
 #include <rockchip/rk_mpi.h>
 #include <assert.h>
 
+// Header-name compatibility for older libdrm uapi headers.
+#ifndef DRM_CLIENT_CAP_WRITEBACK_CONNECTORS
+#define DRM_CLIENT_CAP_WRITEBACK_CONNECTORS 5
+#endif
+#ifndef DRM_MODE_CONNECTOR_WRITEBACK
+#define DRM_MODE_CONNECTOR_WRITEBACK 18
+#endif
+
 int modeset_open(int *out, const char *node)
 {
 	int fd, ret;
@@ -40,6 +48,12 @@ int modeset_open(int *out, const char *node)
 	if (ret) {
 		fprintf(stderr, "failed to set atomic cap, %d", ret);
 		return ret;
+	}
+
+	// Opt in to writeback connectors — they are hidden from enumeration otherwise. Non-fatal:
+	// if the kernel lacks writeback support, OSD-in-DVR simply records clean video (no OSD).
+	if (drmSetClientCap(fd, DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1) != 0) {
+		fprintf(stdout, "writeback-connectors cap unavailable (DVR writeback capture disabled)\n");
 	}
 
 	if (drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &cap) < 0 || !cap) {
@@ -303,6 +317,8 @@ void modeset_destroy_objects(int fd, struct modeset_output *out)
 	modeset_drm_object_fini(&out->crtc);
 	modeset_drm_object_fini(&out->video_plane);
 	modeset_drm_object_fini(&out->osd_plane);
+	if (out->wb_connector.props)
+		modeset_drm_object_fini(&out->wb_connector);
 }
 
 
@@ -402,6 +418,202 @@ void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 	drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 }
 
+
+int modeset_find_writeback(int fd, struct modeset_output *out)
+{
+	out->wb_available = false;
+	out->wb_connector.props = NULL;
+
+	drmModeRes *res = drmModeGetResources(fd);
+	if (!res) {
+		fprintf(stderr, "modeset_find_writeback: cannot get resources: %m\n");
+		return -ENOENT;
+	}
+
+	for (int i = 0; i < res->count_connectors && !out->wb_available; i++) {
+		drmModeConnector *conn = drmModeGetConnector(fd, res->connectors[i]);
+		if (!conn)
+			continue;
+		if (conn->connector_type != DRM_MODE_CONNECTOR_WRITEBACK) {
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		// The writeback connector's encoder must be able to drive our CRTC.
+		bool crtc_ok = false;
+		for (int e = 0; e < conn->count_encoders && !crtc_ok; e++) {
+			drmModeEncoder *enc = drmModeGetEncoder(fd, conn->encoders[e]);
+			if (!enc)
+				continue;
+			if (enc->possible_crtcs & (1 << out->crtc_index))
+				crtc_ok = true;
+			drmModeFreeEncoder(enc);
+		}
+		if (!crtc_ok) {
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		out->wb_connector.id = conn->connector_id;
+		modeset_get_object_properties(fd, &out->wb_connector, DRM_MODE_OBJECT_CONNECTOR);
+		if (!out->wb_connector.props) {
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		int64_t fb_prop    = get_property_value(fd, out->wb_connector.props, "WRITEBACK_FB_ID");
+		int64_t fence_prop = get_property_value(fd, out->wb_connector.props, "WRITEBACK_OUT_FENCE_PTR");
+		int64_t fmts_blob  = get_property_value(fd, out->wb_connector.props, "WRITEBACK_PIXEL_FORMATS");
+		if (fb_prop < 0 || fence_prop < 0) {
+			modeset_drm_object_fini(&out->wb_connector);
+			out->wb_connector.props = NULL;
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		// Prefer NV12 (encoder-native, no color convert, ~half the DDR of BGRA); else a packed
+		// 32bpp RGB the encoder can convert in hardware.
+		uint32_t chosen = 0;
+		if (fmts_blob > 0) {
+			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(fd, (uint32_t)fmts_blob);
+			if (blob && blob->data) {
+				const uint32_t *fmts = (const uint32_t *)blob->data;
+				int n = blob->length / sizeof(uint32_t);
+				const uint32_t want[] = { DRM_FORMAT_NV12, DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
+				for (int w = 0; w < 3 && !chosen; w++)
+					for (int k = 0; k < n; k++)
+						if (fmts[k] == want[w]) { chosen = want[w]; break; }
+			}
+			if (blob)
+				drmModeFreePropertyBlob(blob);
+		}
+		if (!chosen) {
+			fprintf(stdout, "Writeback: no NV12/XRGB/ARGB format advertised, trying NV12\n");
+			chosen = DRM_FORMAT_NV12;
+		}
+		out->wb_fourcc = chosen;
+		out->wb_available = true;
+
+		const char *fs = drm_fourcc_to_string(chosen);
+		fprintf(stdout, "Writeback connector %u available for CRTC %u, output format %s\n",
+			conn->connector_id, out->crtc.id, fs);
+		free((void *)fs);
+		drmModeFreeConnector(conn);
+	}
+
+	drmModeFreeResources(res);
+	if (!out->wb_available)
+		fprintf(stdout, "No usable DRM writeback connector for CRTC %u\n", out->crtc.id);
+	return out->wb_available ? 0 : -ENOENT;
+}
+
+int modeset_create_wb_fb(int fd, struct modeset_buf *buf, uint32_t fourcc)
+{
+	struct drm_mode_create_dumb creq;
+	struct drm_mode_destroy_dumb dreq;
+	int ret;
+	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
+
+	buf->prime_fd = -1;
+	buf->map = NULL;
+
+	// Pad the vertical stride to 16 so the MPP encoder (which aligns ver_stride) reads the CbCr
+	// plane / trailing rows from the same offset the buffer is laid out at. The FB is added at the
+	// true display height; the VOP writes only those rows.
+	uint32_t ver = (buf->height + 15) & ~15u;
+
+	if (fourcc == DRM_FORMAT_NV12) {
+		// One dumb allocation holding Y (ver rows) then interleaved CbCr (ver/2 rows), bpp 8.
+		// CbCr plane offset = Y_stride * ver, which equals hor_stride * ver_stride on the encoder
+		// side, so the VOP's write layout and MPP's read layout agree.
+		memset(&creq, 0, sizeof(creq));
+		creq.width  = buf->width;
+		creq.height = ver * 3 / 2;
+		creq.bpp    = 8;
+		ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+		if (ret < 0) {
+			fprintf(stderr, "cannot create NV12 wb buffer (%d): %m\n", errno);
+			return -errno;
+		}
+		buf->stride = creq.pitch;
+		buf->size   = creq.size;
+		buf->handle = creq.handle;
+
+		handles[0] = buf->handle; pitches[0] = buf->stride; offsets[0] = 0;
+		handles[1] = buf->handle; pitches[1] = buf->stride; offsets[1] = buf->stride * ver;
+		ret = drmModeAddFB2(fd, buf->width, buf->height, DRM_FORMAT_NV12,
+				    handles, pitches, offsets, &buf->fb, 0);
+	} else {
+		// Packed 32bpp (XRGB/ARGB).
+		memset(&creq, 0, sizeof(creq));
+		creq.width  = buf->width;
+		creq.height = ver;
+		creq.bpp    = 32;
+		ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+		if (ret < 0) {
+			fprintf(stderr, "cannot create wb buffer (%d): %m\n", errno);
+			return -errno;
+		}
+		buf->stride = creq.pitch;
+		buf->size   = creq.size;
+		buf->handle = creq.handle;
+
+		handles[0] = buf->handle; pitches[0] = buf->stride;
+		ret = drmModeAddFB2(fd, buf->width, buf->height, fourcc,
+				    handles, pitches, offsets, &buf->fb, 0);
+	}
+
+	if (ret) {
+		fprintf(stderr, "cannot create wb framebuffer (%d): %m\n", errno);
+		ret = -errno;
+		goto err_destroy;
+	}
+
+	ret = drmPrimeHandleToFD(fd, buf->handle, DRM_CLOEXEC | DRM_RDWR, &buf->prime_fd);
+	if (ret) {
+		fprintf(stderr, "cannot export wb prime fd (%d): %m\n", errno);
+		ret = -errno;
+		goto err_fb;
+	}
+	return 0;
+
+err_fb:
+	drmModeRmFB(fd, buf->fb);
+err_destroy:
+	memset(&dreq, 0, sizeof(dreq));
+	dreq.handle = buf->handle;
+	drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+	return ret;
+}
+
+void modeset_destroy_wb_fb(int fd, struct modeset_buf *buf)
+{
+	struct drm_mode_destroy_dumb dreq;
+
+	if (buf->prime_fd >= 0) {
+		close(buf->prime_fd);
+		buf->prime_fd = -1;
+	}
+	if (buf->fb)
+		drmModeRmFB(fd, buf->fb);
+	if (buf->handle) {
+		memset(&dreq, 0, sizeof(dreq));
+		dreq.handle = buf->handle;
+		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+	}
+}
+
+int modeset_add_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr)
+{
+	if (set_drm_object_property(req, &out->wb_connector, "CRTC_ID", out->crtc.id) < 0)
+		return -1;
+	if (set_drm_object_property(req, &out->wb_connector, "WRITEBACK_FB_ID", wb_fb) < 0)
+		return -1;
+	if (set_drm_object_property(req, &out->wb_connector, "WRITEBACK_OUT_FENCE_PTR",
+				    (uint64_t)(uintptr_t)out_fence_ptr) < 0)
+		return -1;
+	return 0;
+}
 
 int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_output *out)
 {
