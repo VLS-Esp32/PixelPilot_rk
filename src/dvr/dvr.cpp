@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
+#include <climits>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -170,7 +172,7 @@ void Dvr::start_recording() {
 void Dvr::stop_recording() {
     dvr_enabled = 0;
     std::lock_guard<std::mutex> lock(mtx);
-    while (!dvrQueue.empty()) dvrQueue.pop();
+    drop_pending_frames();
     dvrQueue.push({ .command = dvr_rpc::RPC_STOP });
     cv.notify_one();
 }
@@ -182,9 +184,7 @@ void Dvr::toggle_recording() {
 void Dvr::shutdown() {
     dvr_enabled = 0;
     std::lock_guard<std::mutex> lock(mtx);
-    while (!dvrQueue.empty()) {
-        dvrQueue.pop();
-    }
+    drop_pending_frames();
     dvrQueue.push({ .command = dvr_rpc::RPC_SHUTDOWN });
     cv.notify_one();
 }
@@ -255,7 +255,7 @@ void Dvr::loop() {
                         release_wb_frame(rpc.frame_info);
                         break;
                     }
-                    if (!storage.has_enough_free(est_free)) {
+                    if (session_free_known && !storage.has_enough_free(est_free)) {
                         spdlog::warn("[ DVR ] low free space (~{}MB left, need {}MB), stopping recording",
                                      est_free / (1024 * 1024), storage.min_free() / (1024 * 1024));
                         stop();
@@ -315,22 +315,41 @@ std::string Dvr::generate_filename() {
     std::string filename_pattern = pathObj.filename().string();
     std::string paddedNumber = "";
 
-    if (!fs::exists(rec_dir)) {
+    std::error_code dir_ec;
+    if (!fs::exists(rec_dir, dir_ec)) {
         spdlog::error("[ DVR ] Directory does not exist: {}", rec_dir);
         return "";
     }
 
     if (dvr_filenames_with_sequence) {
-        // Next sequence number = max existing "<digits>_..." prefix + 1.
-        std::regex pattern(R"(^(\d+)_.*)");
+        // Next sequence number = max existing "<digits>_..." prefix + 1. This runs on every segment
+        // rotation, so it must never throw: the card can disappear mid-scan (filesystem_error) and a
+        // long digit prefix would overflow a plain stoi - either would terminate the process.
         int maxNumber = -1;
-        for (const auto &entry : fs::directory_iterator(rec_dir)) {
-            if (!entry.is_regular_file())
-                continue;
-            std::string filename = entry.path().filename().string();
-            std::smatch match;
-            if (std::regex_match(filename, match, pattern))
-                maxNumber = std::max(maxNumber, std::stoi(match[1].str()));
+        try {
+            std::regex pattern(R"(^(\d+)_.*)");
+            std::error_code ec;
+            for (const auto &entry : fs::directory_iterator(rec_dir, ec)) {
+                std::error_code entry_ec;
+                if (!entry.is_regular_file(entry_ec))
+                    continue;
+                std::string filename = entry.path().filename().string();
+                std::smatch match;
+                if (!std::regex_match(filename, match, pattern))
+                    continue;
+                errno = 0;
+                long number = std::strtol(match[1].str().c_str(), nullptr, 10);
+                if (errno == 0 && number >= 0 && number < INT_MAX) {
+                    maxNumber = std::max(maxNumber, (int)number);
+                }
+            }
+            if (ec) {
+                spdlog::warn("[ DVR ] could not scan {} for sequence numbers: {}", rec_dir, ec.message());
+            }
+        } catch (const std::exception &e) {
+            spdlog::warn("[ DVR ] sequence scan of {} failed ({}), falling back to timestamp-only name",
+                         rec_dir, e.what());
+            maxNumber = -1;
         }
         int nextFileNumber = (maxNumber == -1) ? 0 : maxNumber + 1;
 
@@ -365,10 +384,17 @@ int Dvr::start() {
     current_filename = mp4_filename;
 
     max_file_bytes = storage.file_size_cap();
-    session_free_at_start = storage.free_bytes(); // one statvfs; mid-recording checks estimate from this
-    spdlog::info("[ DVR ] storage: {}MB free, per-file cap {}MB",
-                 session_free_at_start / (1024 * 1024),
-                 max_file_bytes / (1024 * 1024));
+    session_free_known = storage.free_bytes(session_free_at_start);
+    if (session_free_known) {
+        spdlog::info("[ DVR ] storage: {}MB free, per-file cap {}MB",
+                     session_free_at_start / (1024 * 1024),
+                     max_file_bytes / (1024 * 1024));
+    } else {
+        session_free_at_start = 0;
+        spdlog::warn("[ DVR ] could not read free space for {} - free-space monitoring disabled "
+                     "for this file (per-file cap {}MB)",
+                     rec_dir, max_file_bytes / (1024 * 1024));
+    }
 
     frames_submitted = 0;
     frames_written   = 0;

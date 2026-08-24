@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <string>
 #include <atomic>
+#include <chrono>
 #include <queue>
 #include <vector>
 #include <mutex>
@@ -27,7 +28,7 @@ public:
     bool begin_video(int width, int height);            // CODEC H265
     bool write_nal(const uint8_t *data, int len, int duration_90k); // enqueues; false if queue is full
     bool close();                                       // drains the queue, then finalizes (moov)
-    bool is_open() const { return file != nullptr; }
+    bool is_open() const { return file != nullptr && !abandoned_; }
 
     // Highest byte offset written so far = the current on-disk file size (updated by the writer
     // thread via write_at). Used to enforce the FAT32 4GB per-file limit without a per-frame fstat.
@@ -46,13 +47,20 @@ private:
     // stall; if exceeded, the SD has been dead far too long - drop and count a failure so the DVR
     // fail-stops rather than growing memory without bound.
     static const size_t MAX_QUEUE_BYTES = 32 * 1024 * 1024;
+    // Longest close() waits for the writer thread to finish the queue. Only exceeded if the card is
+    // wedged (uninterruptible I/O); bounded so shutdown can't hang until systemd SIGKILLs us.
+    static constexpr std::chrono::seconds DRAIN_TIMEOUT{5};
 
     void writer_loop();
-    void drain();   // block until the queue is empty and the writer thread is idle
+    bool drain();   // block until the queue is empty and the writer thread is idle; false on timeout
 
     FILE *file = nullptr;
     MP4E_mux_tag *mux = nullptr;
     mp4_h26x_writer_tag *writer = nullptr;
+    // Set when a drain timed out: the writer thread may still be stuck inside a write, so file/mux
+    // must not be finalized or reused. The Mp4Writer is dead for the rest of the process; the
+    // destructor joins the writer thread and frees once it does return.
+    bool abandoned_ = false;
     std::atomic<uint64_t> file_size_bytes{0};
     uint32_t write_fail_count = 0;                  // writer thread only (warn throttle)
     std::atomic<uint32_t> write_fail_streak{0};     // writer thread writes, DVR reads

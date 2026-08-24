@@ -1,4 +1,6 @@
 #include <cstdint>
+#include <chrono>
+#include <thread>
 
 #include <rockchip/rk_mpi.h>
 
@@ -151,19 +153,32 @@ void MppEncoder::flush(const std::function<bool(const uint8_t *, int)> &on_nal) 
     mpi->encode_put_frame(ctx, eos_frame);
     mpp_frame_deinit(&eos_frame);
 
-    // Switch to blocking output so encode_get_packet waits for each packet. With
-    // timeout=0 the loop would exit before the encoder finishes flushing, leaving
-    // the following reset() to block for 8+ seconds.
-    RK_S64 block = -1;
+    // Wait for each packet instead of returning immediately: with timeout=0 the loop would exit
+    // before the encoder finishes flushing, leaving the following reset() to block for 8+ seconds.
+    // A finite per-call timeout (rather than -1) keeps every call returning, so the overall deadline
+    // below can bound the flush if the encoder wedges - otherwise shutdown hangs until SIGKILL and
+    // the recording loses its moov.
+    RK_S64 block = FLUSH_PACKET_TIMEOUT_MS;
     mpi->control(ctx, MPP_SET_OUTPUT_TIMEOUT, &block);
 
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(FLUSH_DEADLINE_MS);
     MppPacket packet = nullptr;
     while (true) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            spdlog::warn("[ DVR MppEncoder ] flush did not complete within {}ms, giving up",
+                         FLUSH_DEADLINE_MS);
+            break;
+        }
         int ret = mpi->encode_get_packet(ctx, &packet);
-        if (ret || !packet) {
-            if (ret) {
-                spdlog::warn("[ DVR MppEncoder ] encode_get_packet failed during flush {}", ret);
-            }
+        if (ret == MPP_ERR_TIMEOUT || (!ret && !packet)) {
+            // Nothing ready yet - keep waiting until the deadline. The short sleep bounds CPU use in
+            // case the timeout control above did not take and this call returns immediately.
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        if (ret) {
+            spdlog::warn("[ DVR MppEncoder ] encode_get_packet failed during flush {}", ret);
             break;
         }
         bool is_eos = mpp_packet_get_eos(packet);

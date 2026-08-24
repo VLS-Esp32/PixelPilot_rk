@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include <signal.h>
 #include <fstream>
+#include <memory>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
@@ -172,9 +173,13 @@ int signal_flag = 0;
 // the DVR's queue cap so one frame can be mid-encode while the queue is full without the display
 // finding no free buffer.
 #define WB_BUF_COUNT 4
+// Throttle for the per-frame "could not arm writeback" warning (once every N failures).
+#define WB_ARM_FAIL_WARN_INTERVAL 300
 static struct modeset_buf wb_bufs[WB_BUF_COUNT];
 static std::atomic<bool>  wb_busy[WB_BUF_COUNT];
 static bool dvr_wb_mode = false;   // writeback available AND selected for this run
+
+static volatile sig_atomic_t dvr_toggle_request = 0;
 
 // Called by the DVR thread once it has finished encoding writeback buffer `index`.
 void pp_wb_release(int index) {
@@ -452,6 +457,14 @@ void *__DISPLAY_THREAD__(void *param)
 		ret = pthread_mutex_unlock(&video_mutex);
 		assert(!ret);
 
+		// Deferred SIGUSR1 handling: safe to take the DVR queue mutex from here.
+		if (dvr_toggle_request) {
+			dvr_toggle_request = 0;
+			if (dvr) {
+				dvr->toggle_recording();
+			}
+		}
+
 		// create new video_request
 		drmModeAtomicFree(output_list->video_request);
 		output_list->video_request = drmModeAtomicAlloc();
@@ -476,11 +489,14 @@ void *__DISPLAY_THREAD__(void *param)
         // block the display on the DVR: if no pool buffer is free we skip capture for this frame.
         // wb_arm_disabled latches writeback off if commits keep failing, so a broken writeback path
         // can never freeze the live display.
-        static bool wb_attached = false;
+        static bool wb_attached = false;   // mirrors kernel state; only updated after a good commit
         static int  wb_commit_fails = 0;
+        static int  wb_arm_fails = 0;
         static bool wb_arm_disabled = false;
         int     wb_idx = -1;
         int32_t wb_out_fence = -1;
+        bool    req_attach = false;   // this request attaches the WB connector with a fresh FB
+        bool    req_detach = false;   // this request detaches it
         bool    want_capture = dvr_wb_mode && !wb_arm_disabled && dvr_enabled && dvr != NULL && fb_id != 0;
         if (want_capture) {
             for (int i = 0; i < WB_BUF_COUNT; i++) {
@@ -495,20 +511,38 @@ void *__DISPLAY_THREAD__(void *param)
                                           wb_bufs[wb_idx].fb, &wb_out_fence) < 0) {
                     wb_busy[wb_idx].store(false, std::memory_order_release);
                     wb_idx = -1;
+                    if (wb_arm_fails++ % WB_ARM_FAIL_WARN_INTERVAL == 0) {
+                        spdlog::warn("[ DVR ] modeset_add_writeback failed, skipping capture ({} times)",
+                                     wb_arm_fails);
+                    }
                 } else {
                     flags = DRM_MODE_ATOMIC_ALLOW_MODESET;   // (re)attaching may count as a modeset
-                    wb_attached = true;
+                    req_attach = true;
+                    wb_arm_fails = 0;
                 }
             }
         }
-        if (wb_idx < 0 && wb_attached) {
+        if (!req_attach && wb_attached) {
             // Not capturing this commit — detach the writeback connector so the atomic check passes.
             set_drm_object_property(output_list->video_request, &output_list->wb_connector, "CRTC_ID", 0);
             flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
-            wb_attached = false;
+            req_detach = true;
         }
 
         int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
+
+        // A failed atomic commit leaves kernel state untouched, so only mirror the request into
+        // wb_attached once the commit actually landed. Recording the intent unconditionally would
+        // leave us believing the connector is detached while the kernel still has it attached with
+        // no framebuffer — every later commit would then fail its atomic check and the live video
+        // plane would never update again.
+        if (commit_ret == 0) {
+            if (req_attach) {
+                wb_attached = true;
+            } else if (req_detach) {
+                wb_attached = false;
+            }
+        }
 
         ret = pthread_mutex_unlock(&osd_mutex);
         assert(!ret);
@@ -536,8 +570,9 @@ void *__DISPLAY_THREAD__(void *param)
                     close(wb_out_fence);
                 }
                 wb_busy[wb_idx].store(false, std::memory_order_release);
-                wb_attached = false;
                 if (++wb_commit_fails >= 3) {
+                    // Latch capture off. wb_attached still reflects the kernel, so the detach branch
+                    // above runs on the next commit and leaves the connector clean.
                     wb_arm_disabled = true;
                     spdlog::error("[ DVR ] writeback commits keep failing — disabling writeback capture (display preserved)");
                 }
@@ -573,9 +608,7 @@ void sig_handler(int signum)
 
 void sigusr1_handler(int signum) {
 	spdlog::info("Received signal {}", signum);
-    if (dvr) {
-		dvr->toggle_recording();
-	}
+	dvr_toggle_request = 1;
 }
 
 void sigusr2_handler(int signum) {
@@ -1321,6 +1354,7 @@ int main(int argc, char **argv)
 	assert(!ret);
 
 	pthread_t tid_display, tid_osd, tid_mavlink, tid_dvr, tid_wfbcli;
+	bool dvr_thread_started = false;
 	if (dvr_template != NULL) {
 		// When OSD-in-DVR is requested, use WYSIWYG writeback capture if the display supports it;
 		// otherwise the DVR records clean video (no OSD).
@@ -1351,6 +1385,15 @@ int main(int argc, char **argv)
 		args.video_p.video_frm_height = output_list->video_frm_height;
 		dvr = new Dvr(args);
 		ret = pthread_create(&tid_dvr, NULL, &Dvr::__THREAD__, dvr);
+		if (ret) {
+			// tid_dvr is not valid, so it must not be joined later. Carry on without the DVR
+			// rather than taking down live video.
+			spdlog::error("Failed to start the DVR thread ({}), recording disabled", ret);
+			delete dvr;
+			dvr = NULL;
+		} else {
+			dvr_thread_started = true;
+		}
 	}
 	ret = pthread_create(&tid_frame, NULL, __FRAME_THREAD__, NULL);
 	assert(!ret);
@@ -1418,13 +1461,16 @@ int main(int argc, char **argv)
     ret = pthread_join(tid_osd, NULL);
     assert(!ret);
 
-    if (dvr_template != NULL) {
+    if (dvr_thread_started) {
         if (dvr != NULL) {
             dvr->shutdown();
         }
         ret = pthread_join(tid_dvr, NULL);
         assert(!ret);
 	}
+    // Every thread that reads `dvr` has been joined by now, so the object can go.
+    delete dvr;
+    dvr = NULL;
 
 	////////////////////////////////////////////// MPI CLEANUP
 

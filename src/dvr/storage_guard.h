@@ -19,7 +19,9 @@ public:
 
     uint64_t file_size_cap() const;
 
-    uint64_t free_bytes() const;
+    // Free space on the recording filesystem. Returns false if it could not be determined, which the
+    // caller must not confuse with "no space left".
+    bool free_bytes(uint64_t &out) const;
 
 private:
     bool is_external_mount() const;

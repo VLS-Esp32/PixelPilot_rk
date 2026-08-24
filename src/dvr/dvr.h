@@ -60,6 +60,7 @@ private:
     StorageGuard storage;
     uint64_t max_file_bytes = 0;
     uint64_t session_free_at_start = 0;  // free bytes at recording start; mid-recording est baseline
+    bool     session_free_known = false; // false if statvfs failed: skip the free-space estimates
     int64_t  last_storage_check_ms = 0;
 
     // Recording frame rate = the display refresh rate (the writeback recording is a screen capture,

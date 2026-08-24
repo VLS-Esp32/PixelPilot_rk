@@ -10,12 +10,13 @@ static const uint64_t FAT32_FILE_SIZE_CAP = (4ULL << 30) - (128ULL << 20); // ~3
 StorageGuard::StorageGuard(const std::string &dir, uint64_t min_free_bytes, bool require_mount)
     : recording_dir(dir), min_free_bytes(min_free_bytes), require_mount(require_mount) {}
 
-uint64_t StorageGuard::free_bytes() const {
+bool StorageGuard::free_bytes(uint64_t &out) const {
     struct statvfs vfs;
     if (statvfs(recording_dir.c_str(), &vfs) != 0) {
-        return 0;
+        return false;
     }
-    return (uint64_t)vfs.f_frsize * (uint64_t)vfs.f_bavail;
+    out = (uint64_t)vfs.f_frsize * (uint64_t)vfs.f_bavail;
+    return true;
 }
 
 bool StorageGuard::is_external_mount() const {
@@ -47,7 +48,11 @@ bool StorageGuard::is_ready(std::string &reason) const {
         reason = "storage not mounted at " + recording_dir;
         return false;
     }
-    uint64_t available = free_bytes();
+    uint64_t available = 0;
+    if (!free_bytes(available)) {
+        reason = "cannot read free space at " + recording_dir;
+        return false;
+    }
     if (available < min_free_bytes) {
         reason = "low free space at " + recording_dir + " (" +
                  std::to_string(available / (1024 * 1024)) + "MB free, need " +

@@ -28,6 +28,11 @@ public:
     bool ready() const { return ctx != nullptr; }
 
 private:
+    // flush() waits for the encoder to emit its buffered frames. Per-call timeout keeps
+    // encode_get_packet returning so the overall deadline can bound a wedged encoder.
+    static constexpr int FLUSH_PACKET_TIMEOUT_MS = 200;
+    static constexpr int FLUSH_DEADLINE_MS       = 3000;
+
     MppCtx    ctx = nullptr;
     MppApi   *mpi = nullptr;
     MppEncCfg cfg = nullptr;
