@@ -70,10 +70,10 @@ static int main_rtp_cb(void* param, const void* packet, int bytes, uint32_t time
     return 0;
 }
 
-RtpReceiver::RtpReceiver(int port)
+RtpReceiver::RtpReceiver(const std::string& address, int port)
 {
     m_running = std::make_shared<std::atomic<bool>>(false);
-    m_socket_handler = std::make_shared<SocketHandler>(port);
+    m_socket_handler = std::make_shared<SocketHandler>(address, port);
     m_codec_detector = std::make_unique<RtpCodecDecoder>(m_running);
 }
 

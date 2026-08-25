@@ -32,7 +32,7 @@ public:
     /**
      * The constructor is delayed, remember to use start_receiving()
      */
-    explicit RtpReceiver(int port);
+    explicit RtpReceiver(const std::string& address, int port);
     explicit RtpReceiver(const char *unix_socket);
     ~RtpReceiver() = default;
 
