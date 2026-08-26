@@ -401,7 +401,7 @@ void *__FRAME_THREAD__(void *param)
 
                     // Decode-tap DVR (VideoOnly) is fed here. Writeback mode taps the composited
                     // output on the display thread instead, so skip it here.
-                    if (dvr_enabled && dvr != NULL && !dvr_wb_mode) {
+                    if (dvr_is_recording() && dvr != NULL && !dvr_wb_mode) {
                         dvr_frame_info dfi;
                         dfi.prime_fd   = mpi.frame_to_drm[i].prime_fd;
                         dfi.width      = output_list->video_frm_width;
@@ -487,17 +487,16 @@ void *__DISPLAY_THREAD__(void *param)
         // FB. A writeback connector attached to the CRTC but without a framebuffer FAILS the atomic
         // check, so on any commit that does NOT capture we must detach it (CRTC_ID=0). We never
         // block the display on the DVR: if no pool buffer is free we skip capture for this frame.
-        // wb_arm_disabled latches writeback off if commits keep failing, so a broken writeback path
-        // can never freeze the live display.
+        // Repeated commit failures disable the DVR centrally (DvrState::Disabled), so a broken
+        // writeback path can never freeze the live display.
         static bool wb_attached = false;   // mirrors kernel state; only updated after a good commit
         static int  wb_commit_fails = 0;
         static int  wb_arm_fails = 0;
-        static bool wb_arm_disabled = false;
         int     wb_idx = -1;
         int32_t wb_out_fence = -1;
         bool    req_attach = false;   // this request attaches the WB connector with a fresh FB
         bool    req_detach = false;   // this request detaches it
-        bool    want_capture = dvr_wb_mode && !wb_arm_disabled && dvr_enabled && dvr != NULL && fb_id != 0;
+        bool    want_capture = dvr_wb_mode && dvr_is_recording() && dvr != NULL && fb_id != 0;
         if (want_capture) {
             for (int i = 0; i < WB_BUF_COUNT; i++) {
                 bool expected = false;
@@ -571,10 +570,10 @@ void *__DISPLAY_THREAD__(void *param)
                 }
                 wb_busy[wb_idx].store(false, std::memory_order_release);
                 if (++wb_commit_fails >= 3) {
-                    // Latch capture off. wb_attached still reflects the kernel, so the detach branch
-                    // above runs on the next commit and leaves the connector clean.
-                    wb_arm_disabled = true;
-                    spdlog::error("[ DVR ] writeback commits keep failing — disabling writeback capture (display preserved)");
+                    // Centrally shut down the DVR to end recording and clear the OSD indicator.
+                    // wb_attached still reflects the kernel, so the detach branch above runs
+                    // on the next commit and leaves the connector clean. Display is untouched.
+                    dvr->disable("writeback commits keep failing (display preserved)");
                 }
             }
         }
@@ -794,14 +793,14 @@ int setup_drm(int print_modelist, uint16_t mode_width, uint16_t mode_height, uin
 static bool setup_writeback()
 {
 	if (modeset_find_writeback(drm_fd, output_list) != 0) {
-		spdlog::info("[ DVR ] no DRM writeback connector — OSD-in-DVR will record clean video");
+		spdlog::error("[ DVR ] no DRM writeback connector available");
 		return false;
 	}
 	for (int i = 0; i < WB_BUF_COUNT; i++) {
 		wb_bufs[i].width  = output_list->mode.hdisplay;
 		wb_bufs[i].height = output_list->mode.vdisplay;
 		if (modeset_create_wb_fb(drm_fd, &wb_bufs[i], output_list->wb_fourcc) != 0) {
-			spdlog::error("[ DVR ] failed to allocate writeback buffer {} — recording clean video", i);
+			spdlog::error("[ DVR ] failed to allocate writeback buffer {}", i);
 			for (int j = 0; j < i; j++) {
 				modeset_destroy_wb_fb(drm_fd, &wb_bufs[j]);
 			}
@@ -819,6 +818,21 @@ static void cleanup_writeback()
 {
 	if (!dvr_wb_mode) {
 		return;
+	}
+	// Detach the writeback connector before its framebuffers go away. If the display thread exited
+	// mid-capture (e.g. SIGTERM during a recording) the connector is still attached to the CRTC;
+	// once its FB is removed, every later atomic commit — including restore_planes_zpos() — fails
+	// the atomic check with EINVAL. Detaching an already-detached connector is a harmless no-op.
+	drmModeAtomicReq *req = drmModeAtomicAlloc();
+	if (req) {
+		if (set_drm_object_property(req, &output_list->wb_connector, "CRTC_ID", 0) > 0) {
+			if (drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) < 0) {
+				spdlog::warn("[ DVR ] writeback detach commit failed: {}", strerror(errno));
+			} else {
+				spdlog::debug("[ DVR ] writeback connector detached");
+			}
+		}
+		drmModeAtomicFree(req);
 	}
 	for (int i = 0; i < WB_BUF_COUNT; i++) {
 		modeset_destroy_wb_fb(drm_fd, &wb_bufs[i]);
@@ -1355,12 +1369,16 @@ int main(int argc, char **argv)
 
 	pthread_t tid_display, tid_osd, tid_mavlink, tid_dvr, tid_wfbcli;
 	bool dvr_thread_started = false;
-	if (dvr_template != NULL) {
-		// When OSD-in-DVR is requested, use WYSIWYG writeback capture if the display supports it;
-		// otherwise the DVR records clean video (no OSD).
-		if (dvr_enable_osd) {
-			dvr_wb_mode = setup_writeback();
+	bool dvr_requested = (dvr_template != NULL);
+	if (dvr_requested && dvr_enable_osd) {
+		dvr_wb_mode = setup_writeback();
+		if (!dvr_wb_mode) {
+			spdlog::error("--dvr-osd requires DRM writeback capture, which is unavailable - "
+			              "recording disabled (drop --dvr-osd to record clean video)");
+			dvr_requested = false;
 		}
+	}
+	if (dvr_requested) {
 		dvr_thread_params args;
 		args.filename_template = dvr_template;
 		args.mp4_fragmentation_mode = mp4_fragmentation_mode;
@@ -1468,10 +1486,6 @@ int main(int argc, char **argv)
         ret = pthread_join(tid_dvr, NULL);
         assert(!ret);
 	}
-    // Every thread that reads `dvr` has been joined by now, so the object can go.
-    delete dvr;
-    dvr = NULL;
-
 	////////////////////////////////////////////// MPI CLEANUP
 
 	cleanup_mpi(packet);
@@ -1481,6 +1495,12 @@ int main(int argc, char **argv)
 	cleanup_drm();
 
     remove(pidFilePath.c_str());
+
+    // Every thread that reads `dvr` has been joined, and ~Mp4Writer joins the mp4 writer
+    // thread, which can block if storage is wedged. Doing it here means such a hang costs only this
+    // process's own exit - the display has already been restored and the DRM state cleaned up.
+    delete dvr;
+    dvr = NULL;
 
 	return 0;
 }

@@ -75,8 +75,11 @@ bool MppEncoder::init(int width, int height, int hor_stride, int ver_stride,
         // Headers (VPS/SPS/PPS) are prepended to each IDR frame, so every output packet
         // is one self-contained frame (matters for the real-PTS FIFO in Dvr).
         MppEncHeaderMode header_mode = MPP_ENC_HEADER_MODE_EACH_IDR;
-        if (mpi->control(ctx, MPP_ENC_SET_HEADER_MODE, &header_mode)) {
-            spdlog::warn("[ DVR MppEncoder ] MPP_ENC_SET_HEADER_MODE failed");
+        ret = mpi->control(ctx, MPP_ENC_SET_HEADER_MODE, &header_mode);
+        if (ret) {
+            spdlog::error("[ DVR MppEncoder ] MPP_ENC_SET_HEADER_MODE failed {}", ret);
+            cleanup();
+            return false;
         }
     }
 
@@ -84,8 +87,11 @@ bool MppEncoder::init(int width, int height, int hor_stride, int ver_stride,
         // Non-blocking output - encode_get_packet returns immediately when no packet is
         // ready. Without this the drain loop blocks forever after the first packet.
         RK_S64 timeout = 0;
-        if (mpi->control(ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout)) {
-            spdlog::warn("[ DVR MppEncoder ] MPP_SET_OUTPUT_TIMEOUT failed");
+        ret = mpi->control(ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout);
+        if (ret) {
+            spdlog::error("[ DVR MppEncoder ] MPP_SET_OUTPUT_TIMEOUT failed {}", ret);
+            cleanup();
+            return false;
         }
     }
 

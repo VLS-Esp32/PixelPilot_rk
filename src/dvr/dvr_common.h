@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <atomic>
 
 struct video_params {
     uint32_t video_frm_width;
@@ -56,7 +57,8 @@ struct dvr_rpc {
         RPC_START,
         RPC_TOGGLE,
         RPC_SHUTDOWN,
-        RPC_SET_PARAMS
+        RPC_SET_PARAMS,
+        RPC_DISABLE     // another thread hit an unrecoverable DVR fault; finalize and stay off
     } command;
     dvr_frame_info frame_info;
 };
@@ -66,7 +68,25 @@ enum class RecordingMode {
     VideoWithOsdWriteback  // DRM writeback - encode the composited display output (video+OSD)
 };
 
-extern int dvr_enabled;
+// The single cross-thread DVR state. Written by the DVR thread (start/stop/fail), the mavlink
+// thread (stop_recording) and main (shutdown); read by the decode and display threads to decide
+// whether to feed frames. Disabled is a latch: an unrecoverable failure sets it and nothing clears
+// it for the rest of the process, so a broken DVR cannot retry in a loop.
+enum class DvrState {
+    Idle,       // not recording, but a start request would be honoured
+    Recording,  // recording; ingress paths should feed frames
+    Disabled    // unrecoverable failure - ignore every start/toggle/frame until restart
+};
+
+extern std::atomic<DvrState> dvr_state;
+
+inline bool dvr_is_recording() {
+    return dvr_state.load(std::memory_order_acquire) == DvrState::Recording;
+}
+
+inline bool dvr_is_disabled() {
+    return dvr_state.load(std::memory_order_acquire) == DvrState::Disabled;
+}
 
 // Release a writeback buffer pool slot back to the display thread once the DVR has finished
 // encoding it. Implemented in main.cpp; called from the DVR thread. Invalid index is ignored.

@@ -25,6 +25,9 @@ public:
     void start_recording();
     void stop_recording();
     void toggle_recording();
+    // Latch the DVR off for the rest of the process from any thread (the display thread uses this
+    // when writeback commits keep failing). Returns immediately; the DVR thread finalizes the file.
+    void disable(const std::string &reason);
     void shutdown();
 
     static void *__THREAD__(void *context);
@@ -35,6 +38,7 @@ private:
     void loop();
     int  start();
     void stop();
+    void fail(const std::string &reason, bool fatal);
     void rotate_recording_file();
     void finalize_current_file();
     void init();
@@ -80,6 +84,8 @@ private:
     int      wb_pending_index = -1;
 
     int _ready_to_write = 0;
+    int init_attempts = 0;        // failed encoder/muxer setups for the current file
+    int frame_error_streak = 0;   // consecutive frames lost to import/fence/submit errors
 
     MppEncoder    encoder;
     Mp4Writer     writer;

@@ -488,8 +488,14 @@ int modeset_find_writeback(int fd, struct modeset_output *out)
 				drmModeFreePropertyBlob(blob);
 		}
 		if (!chosen) {
-			fprintf(stdout, "Writeback: no NV12/XRGB/ARGB format advertised, trying NV12\n");
-			chosen = DRM_FORMAT_NV12;
+			// Do not guess a format the connector did not advertise: the commit would fail later
+			// with an opaque EINVAL instead of here, where the cause is obvious.
+			fprintf(stdout, "Writeback: connector %u advertises no usable format (want NV12/XRGB/ARGB)\n",
+				conn->connector_id);
+			modeset_drm_object_fini(&out->wb_connector);
+			out->wb_connector.props = NULL;
+			drmModeFreeConnector(conn);
+			continue;
 		}
 		out->wb_fourcc = chosen;
 		out->wb_available = true;
@@ -959,6 +965,19 @@ void restore_planes_zpos(int fd, struct modeset_output *output_list) {
 	// restore osd zpos
 	int ret, flags;
 	struct modeset_buf *buf = &output_list->osd_bufs[0];
+
+	// Start from empty requests. These objects are the ones the display/OSD threads were filling
+	// per frame, and they still carry every property from the last frame those threads built - for
+	// video_request that can include WRITEBACK_FB_ID naming a writeback buffer that has since been
+	// removed by cleanup_writeback(), which makes the commit below fail with EINVAL.
+	drmModeAtomicFree(output_list->osd_request);
+	output_list->osd_request = drmModeAtomicAlloc();
+	drmModeAtomicFree(output_list->video_request);
+	output_list->video_request = drmModeAtomicAlloc();
+	if (!output_list->osd_request || !output_list->video_request) {
+		fprintf(stderr, "restore_planes_zpos: cannot allocate atomic requests\n");
+		return;
+	}
 
 	// TODO(geehe) Find a more elegant way to do this.
 	int64_t zpos = get_property_value(fd, output_list->osd_plane.props, "zpos");

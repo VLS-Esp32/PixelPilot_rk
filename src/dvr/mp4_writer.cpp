@@ -33,21 +33,17 @@ Mp4Writer::Mp4Writer() {
 }
 
 Mp4Writer::~Mp4Writer() {
-    bool abandoned;
     {
         std::lock_guard<std::mutex> lock(qm_);
         quit_ = true;
-        abandoned = abandoned_;
     }
     qcv_.notify_all();
-    if (abandoned) {
-        // The writer thread is stuck in an uninterruptible write and may still reference `writer`.
-        // Joining would hang and freeing would be a use-after-free; let the process teardown reap it.
-        if (writer_thread_.joinable()) {
-            writer_thread_.detach();
-        }
-        return;
-    }
+    // The writer thread holds a raw pointer to this object, so detaching it would leave
+    // it reading freed memory - its own mutex, condvars and queue - the moment a stuck write
+    // returned. If the card is wedged the thread is parked in uninterruptible I/O and this blocks
+    // until supervised teardown kills the process, which costs nothing extra: that recording was
+    // already abandoned unfinalized. Only reachable at process exit; close() stays bounded, so
+    // segment rotation and stop are unaffected.
     if (writer_thread_.joinable()) {
         writer_thread_.join();
     }

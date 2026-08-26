@@ -25,7 +25,7 @@ extern "C" {
 
 namespace fs = std::filesystem;
 
-int dvr_enabled = 0;
+std::atomic<DvrState> dvr_state{DvrState::Idle};
 
 static const int SEQUENCE_PADDING = 4;   // zero-padding width for sequence-numbered filenames
 
@@ -55,6 +55,15 @@ static const uint32_t MAX_CONSECUTIVE_WRITE_FAILURES = 5;
 // encode a half-written buffer.
 static const int WB_FENCE_TIMEOUT_MS = 200;
 
+// Failed encoder/muxer setups before we give up. Without a cap a permanently broken encoder is
+// re-created on every frame, and cleanup()'s mpi->reset() alone can block 8s - at 60fps that is a
+// retry storm, not a recovery.
+static const int MAX_INIT_ATTEMPTS = 3;
+
+// Consecutive frames lost to per-frame errors (buffer import, capture fence, encoder submit) before
+// we treat the pipeline as broken. These are individually transient, so only a sustained run counts.
+static const int MAX_FRAME_ERROR_STREAK = 60;
+
 static int64_t monotonic_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -78,9 +87,7 @@ Dvr::Dvr(dvr_thread_params params)
         wb_enc_hor_stride = params.wb_hor_stride_bytes;
         wb_enc_ver_stride = params.wb_ver_stride;
     } else {
-        if (params.enable_osd_in_dvr) {
-            spdlog::warn("[ DVR ] OSD-in-DVR requested but writeback unavailable — recording clean video (no OSD)");
-        }
+        // Clean video from the decode tap.
         mode = RecordingMode::VideoOnly;
     }
 
@@ -170,7 +177,8 @@ void Dvr::start_recording() {
 }
 
 void Dvr::stop_recording() {
-    dvr_enabled = 0;
+    DvrState expected = DvrState::Recording;
+    dvr_state.compare_exchange_strong(expected, DvrState::Idle, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(mtx);
     drop_pending_frames();
     dvrQueue.push({ .command = dvr_rpc::RPC_STOP });
@@ -181,8 +189,21 @@ void Dvr::toggle_recording() {
     enqueue_dvr_command({ .command = dvr_rpc::RPC_TOGGLE });
 }
 
+void Dvr::disable(const std::string &reason) {
+    DvrState prev = dvr_state.exchange(DvrState::Disabled, std::memory_order_acq_rel);
+    if (prev == DvrState::Disabled) {
+        return;
+    }
+    spdlog::error("[ DVR ] disabling DVR for this session: {}", reason);
+    std::lock_guard<std::mutex> lock(mtx);
+    drop_pending_frames();
+    dvrQueue.push({ .command = dvr_rpc::RPC_DISABLE });
+    cv.notify_one();
+}
+
 void Dvr::shutdown() {
-    dvr_enabled = 0;
+    DvrState expected = DvrState::Recording;
+    dvr_state.compare_exchange_strong(expected, DvrState::Idle, std::memory_order_acq_rel);
     std::lock_guard<std::mutex> lock(mtx);
     drop_pending_frames();
     dvrQueue.push({ .command = dvr_rpc::RPC_SHUTDOWN });
@@ -213,6 +234,15 @@ void Dvr::loop() {
         dvr_rpc rpc = dvrQueue.front();
         dvrQueue.pop();
         lock.unlock();
+
+        // Once disabled, only SHUTDOWN and the DISABLE finalize still mean anything. Frames must
+        // still be released or the display thread's writeback pool starves.
+        if (dvr_is_disabled() &&
+            rpc.command != dvr_rpc::RPC_SHUTDOWN && rpc.command != dvr_rpc::RPC_DISABLE) {
+            release_wb_frame(rpc.frame_info);
+            continue;
+        }
+
         switch (rpc.command) {
         case dvr_rpc::RPC_SET_PARAMS:
             spdlog::debug("[ DVR ] got rpc SET_PARAMS");
@@ -250,15 +280,15 @@ void Dvr::loop() {
                     uint64_t written = writer.size();
                     uint64_t est_free = session_free_at_start > written ? session_free_at_start - written : 0;
                     if (!storage.mount_ok()) {
-                        spdlog::warn("[ DVR ] storage no longer mounted, stopping recording");
-                        stop();
+                        // The card is gone; nothing will make the next file openable.
+                        fail("storage no longer mounted", true);
                         release_wb_frame(rpc.frame_info);
                         break;
                     }
                     if (session_free_known && !storage.has_enough_free(est_free)) {
-                        spdlog::warn("[ DVR ] low free space (~{}MB left, need {}MB), stopping recording",
-                                     est_free / (1024 * 1024), storage.min_free() / (1024 * 1024));
-                        stop();
+                        fail("low free space (~" + std::to_string(est_free / (1024 * 1024)) +
+                                 "MB left, need " + std::to_string(storage.min_free() / (1024 * 1024)) + "MB)",
+                             true);
                         release_wb_frame(rpc.frame_info);
                         break;
                     }
@@ -278,7 +308,18 @@ void Dvr::loop() {
             }
             if (!_ready_to_write) {
                 if (writer.is_open() && video_frm_width > 0 && video_frm_height > 0) {
+                    // Bounded: a permanently broken encoder must not be rebuilt on every frame.
+                    if (init_attempts >= MAX_INIT_ATTEMPTS) {
+                        fail("encoder/muxer setup failed " + std::to_string(init_attempts) + " times",
+                             true);
+                        release_wb_frame(rpc.frame_info);
+                        break;
+                    }
+                    init_attempts++;
                     init();
+                    if (_ready_to_write) {
+                        init_attempts = 0;
+                    }
                 }
                 if (!_ready_to_write) {
                     spdlog::debug("[ DVR ] RPC_FRAME: encoder not ready (awaiting video params), skipping");
@@ -288,16 +329,27 @@ void Dvr::loop() {
             }
             encode_and_write(rpc.frame_info);
 
+            if (frame_error_streak >= MAX_FRAME_ERROR_STREAK) {
+                fail(std::to_string(frame_error_streak) + " consecutive frames failed to encode", true);
+                break;
+            }
             {
                 uint32_t fails = writer.consecutive_write_failures();
                 if (fails >= MAX_CONSECUTIVE_WRITE_FAILURES) {
-                    spdlog::error("[ DVR ] {} consecutive write failures (disk full or I/O error), stopping recording",
-                                  fails);
-                    stop();
+                    fail(std::to_string(fails) + " consecutive write failures (disk full or I/O error)",
+                         true);
                 }
             }
             break;
         }
+        case dvr_rpc::RPC_DISABLE:
+            // Another thread already latched Disabled and logged why; just finalize what is open.
+            spdlog::debug("[ DVR ] got rpc DISABLE");
+            if (writer.is_open()) {
+                stop();
+            }
+            osd_publish_bool_fact("dvr.recording", NULL, 0, false);
+            break;
         case dvr_rpc::RPC_SHUTDOWN:
             spdlog::debug("[ DVR ] got rpc SHUTDOWN");
             goto end;
@@ -376,9 +428,11 @@ int Dvr::start() {
 
     std::string mp4_filename = generate_filename();
     if (mp4_filename.empty()) {
+        osd_publish_bool_fact("dvr.recording", NULL, 0, false);
         return -1;
     }
     if (!writer.open(mp4_filename, mp4_fragmentation_mode)) {
+        osd_publish_bool_fact("dvr.recording", NULL, 0, false);
         return -1;
     }
     current_filename = mp4_filename;
@@ -402,9 +456,11 @@ int Dvr::start() {
     while (!submitted_pts.empty()) {
         submitted_pts.pop();
     }
+    init_attempts     = 0;
+    frame_error_streak = 0;
 
     osd_publish_bool_fact("dvr.recording", NULL, 0, true);
-    dvr_enabled = 1;
+    dvr_state.store(DvrState::Recording, std::memory_order_release);
     return 0;
 }
 
@@ -512,6 +568,7 @@ void Dvr::encode_and_write_wb(dvr_frame_info info) {
         if (pr <= 0) {
             spdlog::warn("[ DVR ] writeback fence wait failed/timed out ({}), dropping frame", pr);
             pp_wb_release(info.wb_index);
+            frame_error_streak++;
             return;
         }
     }
@@ -533,6 +590,7 @@ void Dvr::encode_and_write_wb(dvr_frame_info info) {
     MppBuffer buf = import_decoder_buffer(info);
     if (!buf) {
         pp_wb_release(info.wb_index);
+        frame_error_streak++;
         return;
     }
     int ret = encoder.submit(buf, (int64_t)info.pts,
@@ -543,8 +601,10 @@ void Dvr::encode_and_write_wb(dvr_frame_info info) {
         submitted_pts.push({ (int64_t)info.pts, info.frame_seq });
         frames_submitted++;
         wb_pending_index = info.wb_index;
+        frame_error_streak = 0;
     } else {
         pp_wb_release(info.wb_index);
+        frame_error_streak++;
     }
 }
 
@@ -574,6 +634,7 @@ void Dvr::encode_and_write(dvr_frame_info info) {
 
     MppBuffer buf = import_decoder_buffer(info);
     if (!buf) {
+        frame_error_streak++;
         return;
     }
     int ret = encoder.submit(buf, (int64_t)info.pts,
@@ -583,6 +644,9 @@ void Dvr::encode_and_write(dvr_frame_info info) {
     if (ret == 0) {
         submitted_pts.push({ (int64_t)info.pts, info.frame_seq });
         frames_submitted++;
+        frame_error_streak = 0;
+    } else {
+        frame_error_streak++;
     }
 }
 
@@ -641,15 +705,29 @@ void Dvr::finalize_current_file() {
 void Dvr::stop() {
     finalize_current_file();
     osd_publish_bool_fact("dvr.recording", NULL, 0, false);
-    dvr_enabled = 0;
+    DvrState expected = DvrState::Recording;
+    dvr_state.compare_exchange_strong(expected, DvrState::Idle, std::memory_order_acq_rel);
+}
+
+void Dvr::fail(const std::string &reason, bool fatal) {
+    if (fatal && dvr_is_disabled()) {
+        return;
+    }
+    if (fatal) {
+        spdlog::error("[ DVR ] disabling DVR for this session: {}", reason);
+    } else {
+        spdlog::warn("[ DVR ] stopping recording: {}", reason);
+    }
+    stop();
+    if (fatal) {
+        dvr_state.store(DvrState::Disabled, std::memory_order_release);
+    }
 }
 
 void Dvr::rotate_recording_file() {
     finalize_current_file();
     if (start() != 0) {
-        spdlog::error("[ DVR ] failed to open next recording file, stopping recording");
-        osd_publish_bool_fact("dvr.recording", NULL, 0, false);
-        dvr_enabled = 0;
+        fail("failed to open next recording file", true);
     }
 }
 
