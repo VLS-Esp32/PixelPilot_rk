@@ -53,6 +53,13 @@
       ]
     },
     {
+      "name": "Current time",
+      "type": "TimeWidget",
+      "x": 850,
+      "y": -24,
+      "facts": []
+    },
+    {
       "name": "WFB client status",
       "type": "IconTplStatusWidget",
       "x": -75,

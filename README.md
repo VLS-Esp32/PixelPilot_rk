@@ -179,6 +179,7 @@ to display any fact (as long as datatype matches):
 * `ExternalSurfaceWidget` - TBD
 * `IconSelectorWidget` - display a icon based on a fact's value
 * `IconStatusWidget` - displays a graphical icon that visualized in white or gray color
+* `TimeWidget` - displays the current date and time.
 
 Specific widgets expect quite concrete facts as input:
 
