@@ -96,6 +96,7 @@ enum AppOption {
     OPT_OSD_CUSTOM_MESSAGE,
     OPT_SCREEN_MODE,
 	OPT_TARGET_FRAME_RATE,
+	OPT_STRETCH_VIDEO,
     OPT_DISABLE_VSYNC,
     OPT_SCREEN_MODE_LIST,
     OPT_WFB_API_PORT,
@@ -123,6 +124,7 @@ static const struct option pixelpilot_long_options[] = {
     {"osd-custom-message",  no_argument,       0, OPT_OSD_CUSTOM_MESSAGE},
     {"screen-mode",         required_argument, 0, OPT_SCREEN_MODE},
     {"target-frame-rate",   required_argument, 0, OPT_TARGET_FRAME_RATE},
+	{"stretch-video",       no_argument,       0, OPT_STRETCH_VIDEO},
     {"disable-vsync",       no_argument,       0, OPT_DISABLE_VSYNC},
     {"screen-mode-list",    no_argument,       0, OPT_SCREEN_MODE_LIST},
     {"wfb-api-port",        required_argument, 0, OPT_WFB_API_PORT},
@@ -146,6 +148,7 @@ int video_zpos = 1;
 bool update_osd_video_size = false;
 bool mavlink_dvr_on_arm = false;
 bool osd_custom_message = false;
+bool stretch_video = false;
 bool disable_vsync = false;
 uint32_t refresh_frequency_ms = 1000;
 
@@ -264,7 +267,7 @@ void init_buffer(MppFrame frame) {
 	ret = mpi.mpi->control(mpi.ctx, MPP_DEC_SET_EXT_BUF_GROUP, mpi.frm_grp);
 	ret = mpi.mpi->control(mpi.ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
 
-	ret = modeset_perform_modeset(drm_fd, output_list, output_list->video_request, &output_list->video_plane, mpi.frame_to_drm[0].fb_id, output_list->video_frm_width, output_list->video_frm_height, video_zpos);
+	ret = modeset_perform_modeset(drm_fd, output_list, output_list->video_request, &output_list->video_plane, mpi.frame_to_drm[0].fb_id, output_list->video_frm_width, output_list->video_frm_height, video_zpos, stretch_video);
 	assert(ret >= 0);
 
 	// dvr setup
@@ -828,6 +831,8 @@ void printHelp() {
 	"                                Makes DRM choose the highest available resolution at the requested FPS\n"
 	"                                For optimal smoothness, use a value equal to or divisible by the video FPS\n"
     "\n"
+	"    --stretch-video           - Stretch video to fill the entire screen, ignoring aspect ratio\n"
+	"\n"
 	"    --disable-vsync           - Disable VSYNC commits\n"
 	"\n"
     "    --screen-mode-list        - Print the list of supported screen modes and exit\n"
@@ -1032,6 +1037,11 @@ int main(int argc, char **argv)
             	return -1;
         	}
         	target_frame_rate = static_cast<uint32_t>(v);
+        	break;
+    	}
+
+		case OPT_STRETCH_VIDEO: { // --stretch-video
+        	stretch_video = true;
         	break;
     	}
 

@@ -651,11 +651,11 @@ struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mod
 	return NULL;
 }
 
-int modeset_perform_modeset(int fd, struct modeset_output *out, drmModeAtomicReq * req, struct drm_object *plane, int fb_id, uint32_t width, uint32_t height, int zpos)
+int modeset_perform_modeset(int fd, struct modeset_output *out, drmModeAtomicReq * req, struct drm_object *plane, int fb_id, uint32_t width, uint32_t height, int zpos, bool stretch)
 {
 	int ret, flags;
 
-	ret = modeset_atomic_prepare_commit(fd, out, req, plane, fb_id, width, height, zpos);
+	ret = modeset_atomic_prepare_commit(fd, out, req, plane, fb_id, width, height, zpos, stretch);
 	if (ret < 0) {
 		fprintf(stderr, "prepare atomic commit failed for plane %d: %m\n", plane->id);
 		return ret;
@@ -680,7 +680,7 @@ int modeset_perform_modeset(int fd, struct modeset_output *out, drmModeAtomicReq
 
 
 int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAtomicReq *req, struct drm_object *plane, 
-	int fb_id, uint32_t width, uint32_t height, int zpos)
+	int fb_id, uint32_t width, uint32_t height, int zpos, bool stretch)
 {
 	if (set_drm_object_property(req, &out->connector, "CRTC_ID", out->crtc.id) < 0)
 		return -1;
@@ -701,18 +701,22 @@ int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAto
 	if (set_drm_object_property(req, plane, "SRC_H", height << 16) < 0)
 		return -1;
 
+	int crtcx = 0, crtcy = 0;
+
 	uint32_t crtcw =  out->video_crtc_width;
 	uint32_t crtch = out->video_crtc_height;
-	float video_ratio = (float)width/height;
-	if (crtcw / video_ratio > crtch) {
-		crtcw = crtch * video_ratio;
-		crtch = crtch;
-	} else {
-		crtcw = crtcw;
-		crtch = crtcw / video_ratio;
+
+	if (!stretch) {
+		float video_ratio = (float)width/height;
+		if (crtcw / video_ratio > crtch) {
+			crtcw = crtch * video_ratio;
+		} else {
+			crtch = crtcw / video_ratio;
+		}
+    	crtcx = (out->video_crtc_width - crtcw) / 2;
+		crtcy = (out->video_crtc_height - crtch) / 2;
 	}
-	int crtcx = (out->video_crtc_width - crtcw) / 2;
-	int crtcy = (out->video_crtc_height - crtch) / 2;
+
 	if (set_drm_object_property(req, plane, "CRTC_X", crtcx) < 0)
 		return -1;
 	if (set_drm_object_property(req, plane, "CRTC_Y", crtcy) < 0)
@@ -734,7 +738,7 @@ void restore_planes_zpos(int fd, struct modeset_output *output_list) {
 
 	// TODO(geehe) Find a more elegant way to do this.
 	int64_t zpos = get_property_value(fd, output_list->osd_plane.props, "zpos");
-	ret = modeset_atomic_prepare_commit(fd, output_list, output_list->osd_request, &output_list->osd_plane, buf->fb, buf->width, buf->height, zpos);
+	ret = modeset_atomic_prepare_commit(fd, output_list, output_list->osd_request, &output_list->osd_plane, buf->fb, buf->width, buf->height, zpos, false);
 	if (ret < 0) {
 		fprintf(stderr, "prepare atomic commit failed for plane %d, %m\n", output_list->osd_plane.id);
 		return;
@@ -744,7 +748,7 @@ void restore_planes_zpos(int fd, struct modeset_output *output_list) {
 		fprintf(stderr, "modeset atomic commit failed for plane %d, %m\n", output_list->osd_plane.id);
 
 	zpos = get_property_value(fd, output_list->video_plane.props, "zpos");
-	ret = modeset_atomic_prepare_commit(fd, output_list, output_list->video_request, &output_list->video_plane, buf->fb, buf->width, buf->height, zpos);
+	ret = modeset_atomic_prepare_commit(fd, output_list, output_list->video_request, &output_list->video_plane, buf->fb, buf->width, buf->height, zpos, false);
 	if (ret < 0) {
 		fprintf(stderr, "prepare atomic commit failed for plane %d, %m\n", output_list->video_plane.id);
 		return;

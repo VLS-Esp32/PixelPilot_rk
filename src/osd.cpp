@@ -1732,7 +1732,7 @@ void *__OSD_THREAD__(void *param) {
 
 	struct modeset_buf *buf = &p->out->osd_bufs[p->out->osd_buf_switch];
 	ret = modeset_perform_modeset(p->fd, p->out, p->out->osd_request, &p->out->osd_plane,
-								  buf->fb, buf->width, buf->height, osd_zpos);
+								  buf->fb, buf->width, buf->height, osd_zpos, false);
 	assert(ret >= 0);
 	while (!osd_thread_signal) {
 		std::unique_lock<std::mutex> lock(mtx);
