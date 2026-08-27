@@ -12,13 +12,14 @@ struct video_params {
 
 struct dvr_frame_info {
     int      prime_fd;
+    // Geometry, VideoOnly (decode-tap) only: the writeback path leaves these zero and encodes with
+    // the fixed wb_enc_* geometry of the writeback buffers instead.
     uint32_t hor_stride;
     uint32_t ver_stride;
     uint32_t width;
     uint32_t height;
     size_t   buf_size;
     uint64_t pts;
-    uint64_t frame_seq;  // monotonic decoded-frame index; gives even, jitter-free frame spacing
     // Writeback path only (VideoWithOsdWriteback): capture-completion fence and pool slot to
     // release once encoded. -1 for the decode-tap VideoOnly path.
     int      fence_fd = -1;
@@ -34,15 +35,11 @@ struct dvr_thread_params {
     int dvr_segment_minutes = 0;
     uint64_t dvr_min_free_bytes = 200ULL * 1024 * 1024;
     bool dvr_require_mount = false;
-    uint32_t display_width = 0;
-    uint32_t display_height = 0;
     uint32_t display_fps = 0;   // display refresh rate (Hz); the DVR encodes at this rate
     // Writeback WYSIWYG capture (set when a DRM writeback connector was probed and OSD recording is
     // requested). The DVR encodes the composited display output the VOP wrote into the WB buffers.
-    // Geometry is the WB buffer's; wb_nv12 picks the encoder input format (NV12 native, else BGRA
-    // with HW convert).
+    // Geometry is the WB buffer's; the format is always NV12 (encoder-native).
     bool     enable_wb = false;
-    bool     wb_nv12 = false;
     uint32_t wb_width = 0;
     uint32_t wb_height = 0;
     uint32_t wb_hor_stride_bytes = 0;

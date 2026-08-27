@@ -196,7 +196,11 @@ void init_buffer(MppFrame frame) {
 	RK_U32 hor_stride = mpp_frame_get_hor_stride(frame);
 	RK_U32 ver_stride = mpp_frame_get_ver_stride(frame);
 	MppFrameFormat fmt = mpp_frame_get_fmt(frame);
-	assert((fmt == MPP_FMT_YUV420SP) || (fmt == MPP_FMT_YUV420SP_10BIT));
+
+    if (fmt != MPP_FMT_YUV420SP) {
+		spdlog::critical("Unsupported decoder pixel format {} — only 8-bit NV12 is supported", (int)fmt);
+		abort();
+	}
 
 	spdlog::info("Frame info changed {}({})x{}({})",
 				 output_list->video_frm_width, hor_stride, output_list->video_frm_height, ver_stride);
@@ -245,7 +249,7 @@ void init_buffer(MppFrame frame) {
 		// new DRM buffer
 		struct drm_mode_create_dumb dmcd;
 		memset(&dmcd, 0, sizeof(dmcd));
-		dmcd.bpp = fmt==MPP_FMT_YUV420SP?8:10;
+		dmcd.bpp = 8;   // NV12; enforced above
 		dmcd.width = hor_stride;
 		dmcd.height = ver_stride*2; // documentation say not v*2/3 but v*2 (additional info included)
 		do {
@@ -382,18 +386,12 @@ void *__FRAME_THREAD__(void *param)
 
 					ts = ats;
 
-                    // one per decoded frame, incl. those the DVR drops; the writeback path reads
-                    // this back on the display thread for jitter-free duration pacing.
-                    static uint64_t dvr_decoded_frame_seq = 0;
-                    dvr_decoded_frame_seq++;
-
 					// send DRM FB to display thread
 					ret = pthread_mutex_lock(&video_mutex);
 					assert(!ret);
 					output_list->video_fb_id = mpi.frame_to_drm[i].fb_id;
                     //output_list->video_fb_index=i;
                     output_list->decoding_pts=feed_data_ts;
-                    output_list->decoding_frame_seq = dvr_decoded_frame_seq;
 					ret = pthread_cond_signal(&video_cond);
 					assert(!ret);
 					ret = pthread_mutex_unlock(&video_mutex);
@@ -410,7 +408,6 @@ void *__FRAME_THREAD__(void *param)
                         dfi.ver_stride = mpp_frame_get_ver_stride(frame);
                         dfi.buf_size   = dfi.hor_stride * dfi.ver_stride * 2;
                         dfi.pts        = feed_data_ts;
-                        dfi.frame_seq  = dvr_decoded_frame_seq;
                         dvr->frame(dfi);
                     }
 
@@ -451,7 +448,6 @@ void *__DISPLAY_THREAD__(void *param)
 		osd_update = osd_update_ready;
 
         uint64_t decoding_pts=fb_id != 0 ? output_list->decoding_pts : get_time_ms();
-        uint64_t decoding_seq = output_list->decoding_frame_seq; // for writeback duration pacing
 		output_list->video_fb_id=0;
 		osd_update_ready = false;
 		ret = pthread_mutex_unlock(&video_mutex);
@@ -554,13 +550,8 @@ void *__DISPLAY_THREAD__(void *param)
                 wb_commit_fails = 0;
                 dvr_frame_info dfi{};
                 dfi.prime_fd   = wb_bufs[wb_idx].prime_fd;
-                dfi.width      = wb_bufs[wb_idx].width;
-                dfi.height     = wb_bufs[wb_idx].height;
-                dfi.hor_stride = wb_bufs[wb_idx].stride;
-                dfi.ver_stride = wb_bufs[wb_idx].height;
                 dfi.buf_size   = wb_bufs[wb_idx].size;
                 dfi.pts        = decoding_pts;
-                dfi.frame_seq  = decoding_seq;
                 dfi.fence_fd   = wb_out_fence;
                 dfi.wb_index   = wb_idx;
                 dvr->writeback_frame(dfi);
@@ -799,7 +790,7 @@ static bool setup_writeback()
 	for (int i = 0; i < WB_BUF_COUNT; i++) {
 		wb_bufs[i].width  = output_list->mode.hdisplay;
 		wb_bufs[i].height = output_list->mode.vdisplay;
-		if (modeset_create_wb_fb(drm_fd, &wb_bufs[i], output_list->wb_fourcc) != 0) {
+		if (modeset_create_wb_fb(drm_fd, &wb_bufs[i]) != 0) {
 			spdlog::error("[ DVR ] failed to allocate writeback buffer {}", i);
 			for (int j = 0; j < i; j++) {
 				modeset_destroy_wb_fb(drm_fd, &wb_bufs[j]);
@@ -808,9 +799,8 @@ static bool setup_writeback()
 		}
 		wb_busy[i].store(false);
 	}
-	spdlog::info("[ DVR ] writeback WYSIWYG capture enabled: {}x{}, {} buffers, format {}",
-		     output_list->mode.hdisplay, output_list->mode.vdisplay, WB_BUF_COUNT,
-		     output_list->wb_fourcc == DRM_FORMAT_NV12 ? "NV12" : "RGB");
+	spdlog::info("[ DVR ] writeback WYSIWYG capture enabled: {}x{}, {} buffers, format NV12",
+		     output_list->mode.hdisplay, output_list->mode.vdisplay, WB_BUF_COUNT);
 	return true;
 }
 
@@ -1388,12 +1378,9 @@ int main(int argc, char **argv)
         args.dvr_segment_minutes = dvr_segment_minutes;
         args.dvr_min_free_bytes = (uint64_t)dvr_min_free_mb * 1024 * 1024;
         args.dvr_require_mount = dvr_require_mount;
-        args.display_width  = output_list->mode.hdisplay;
-        args.display_height = output_list->mode.vdisplay;
         args.display_fps    = output_list->mode.vrefresh;
         args.enable_wb = dvr_wb_mode;
         if (dvr_wb_mode) {
-            args.wb_nv12 = (output_list->wb_fourcc == DRM_FORMAT_NV12);
             args.wb_width  = output_list->mode.hdisplay;
             args.wb_height = output_list->mode.vdisplay;
             args.wb_hor_stride_bytes = wb_bufs[0].stride;              // Y stride (NV12) / BGRA stride

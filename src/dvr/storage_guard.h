@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <sys/types.h>
 
 class StorageGuard {
 public:
@@ -16,6 +17,12 @@ public:
     bool mount_ok() const;
     bool has_enough_free(uint64_t free_bytes_estimate) const { return free_bytes_estimate >= min_free_bytes; }
     uint64_t min_free() const { return min_free_bytes; }
+
+    // Device id of the recording directory (one stat, no filesystem I/O). The caller samples this at
+    // the start of a recording and re-checks it periodically: pulling the card either makes the stat
+    // fail or drops the mount, leaving the path resolving to the underlying filesystem with a
+    // different id. Free space cannot detect that - the underlying filesystem reports its own.
+    bool device_id(dev_t &out) const;
 
     uint64_t file_size_cap() const;
 

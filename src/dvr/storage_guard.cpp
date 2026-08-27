@@ -19,6 +19,15 @@ bool StorageGuard::free_bytes(uint64_t &out) const {
     return true;
 }
 
+bool StorageGuard::device_id(dev_t &out) const {
+    struct stat sdir;
+    if (stat(recording_dir.c_str(), &sdir) != 0) {
+        return false;
+    }
+    out = sdir.st_dev;
+    return true;
+}
+
 bool StorageGuard::is_external_mount() const {
     struct stat sdir;
     struct stat sroot;
@@ -44,6 +53,11 @@ bool StorageGuard::mount_ok() const {
 }
 
 bool StorageGuard::is_ready(std::string &reason) const {
+    struct stat sdir;
+    if (stat(recording_dir.c_str(), &sdir) != 0) {
+        reason = "recording directory " + recording_dir + " does not exist";
+        return false;
+    }
     if (require_mount && !is_external_mount()) {
         reason = "storage not mounted at " + recording_dir;
         return false;

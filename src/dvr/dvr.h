@@ -14,7 +14,7 @@
 class Dvr {
 public:
     explicit Dvr(dvr_thread_params params);
-    virtual ~Dvr();
+    ~Dvr();
 
     void frame(dvr_frame_info info);
     // Writeback (WYSIWYG) ingress: fed the composited display output from the display thread
@@ -65,6 +65,8 @@ private:
     uint64_t max_file_bytes = 0;
     uint64_t session_free_at_start = 0;  // free bytes at recording start; mid-recording est baseline
     bool     session_free_known = false; // false if statvfs failed: skip the free-space estimates
+    dev_t    session_dev = 0;
+    bool     session_dev_known = false;
     int64_t  last_storage_check_ms = 0;
 
     // Recording frame rate = the display refresh rate (the writeback recording is a screen capture,
@@ -75,8 +77,7 @@ private:
     uint32_t video_frm_height = 0;
 
     // Writeback mode geometry (VideoWithOsdWriteback): the composited buffer the display thread
-    // hands us. wb_nv12 selects the encoder input format (NV12 native vs BGRA).
-    bool     wb_nv12 = false;
+    // hands us, always NV12.
     uint32_t wb_enc_width = 0;
     uint32_t wb_enc_height = 0;
     uint32_t wb_enc_hor_stride = 0;   // bytes (Y stride for NV12, or BGRA byte stride)
@@ -94,8 +95,7 @@ private:
 
     uint32_t frames_submitted = 0;
     uint32_t frames_written   = 0;   // frames handed to the writer (enqueued), not yet on disk
-    struct FrameStamp { int64_t pts; uint64_t seq; };
-    std::queue<FrameStamp> submitted_pts; // FIFO of submitted frame {pts, seq}, encode order
+    std::queue<int64_t> submitted_pts;   // FIFO of submitted frame pts (ms), encode order
     int64_t  rec_start_pts = -1;         // feed-pts (ms) of the first frame of the current segment
     int      last_good_duration = 0;     // last computed duration (90k ticks); fallback
 };

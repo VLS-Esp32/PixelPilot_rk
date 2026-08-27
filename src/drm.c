@@ -217,16 +217,6 @@ int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn, struct mo
 	return -ENOENT;
 }
 
-const char* drm_fourcc_to_string(uint32_t fourcc) {
-    char* result = malloc(5);
-    result[0] = (char)((fourcc >> 0) & 0xFF);
-    result[1] = (char)((fourcc >> 8) & 0xFF);
-    result[2] = (char)((fourcc >> 16) & 0xFF);
-    result[3] = (char)((fourcc >> 24) & 0xFF);
-    result[4] = '\0';
-    return result;
-}
-
 int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *plane_out, uint32_t plane_format)
 {
 	drmModePlaneResPtr plane_res;
@@ -471,39 +461,32 @@ int modeset_find_writeback(int fd, struct modeset_output *out)
 			continue;
 		}
 
-		// Prefer NV12 (encoder-native, no color convert, ~half the DDR of BGRA); else a packed
-		// 32bpp RGB the encoder can convert in hardware.
-		uint32_t chosen = 0;
+        bool has_nv12 = false;
 		if (fmts_blob > 0) {
 			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(fd, (uint32_t)fmts_blob);
 			if (blob && blob->data) {
 				const uint32_t *fmts = (const uint32_t *)blob->data;
 				int n = blob->length / sizeof(uint32_t);
-				const uint32_t want[] = { DRM_FORMAT_NV12, DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
-				for (int w = 0; w < 3 && !chosen; w++)
-					for (int k = 0; k < n; k++)
-						if (fmts[k] == want[w]) { chosen = want[w]; break; }
+                for (int k = 0; k < n; k++)
+                    if (fmts[k] == DRM_FORMAT_NV12) { has_nv12 = true; break; }
 			}
 			if (blob)
 				drmModeFreePropertyBlob(blob);
 		}
-		if (!chosen) {
+        if (!has_nv12) {
 			// Do not guess a format the connector did not advertise: the commit would fail later
 			// with an opaque EINVAL instead of here, where the cause is obvious.
-			fprintf(stdout, "Writeback: connector %u advertises no usable format (want NV12/XRGB/ARGB)\n",
+            fprintf(stdout, "Writeback: connector %u does not advertise NV12\n",
 				conn->connector_id);
 			modeset_drm_object_fini(&out->wb_connector);
 			out->wb_connector.props = NULL;
 			drmModeFreeConnector(conn);
 			continue;
 		}
-		out->wb_fourcc = chosen;
 		out->wb_available = true;
 
-		const char *fs = drm_fourcc_to_string(chosen);
-		fprintf(stdout, "Writeback connector %u available for CRTC %u, output format %s\n",
-			conn->connector_id, out->crtc.id, fs);
-		free((void *)fs);
+        fprintf(stdout, "Writeback connector %u available for CRTC %u, output format NV12\n",
+            conn->connector_id, out->crtc.id);
 		drmModeFreeConnector(conn);
 	}
 
@@ -513,7 +496,7 @@ int modeset_find_writeback(int fd, struct modeset_output *out)
 	return out->wb_available ? 0 : -ENOENT;
 }
 
-int modeset_create_wb_fb(int fd, struct modeset_buf *buf, uint32_t fourcc)
+int modeset_create_wb_fb(int fd, struct modeset_buf *buf)
 {
 	struct drm_mode_create_dumb creq;
 	struct drm_mode_destroy_dumb dreq;
@@ -528,46 +511,23 @@ int modeset_create_wb_fb(int fd, struct modeset_buf *buf, uint32_t fourcc)
 	// true display height; the VOP writes only those rows.
 	uint32_t ver = (buf->height + 15) & ~15u;
 
-	if (fourcc == DRM_FORMAT_NV12) {
-		// One dumb allocation holding Y (ver rows) then interleaved CbCr (ver/2 rows), bpp 8.
-		// CbCr plane offset = Y_stride * ver, which equals hor_stride * ver_stride on the encoder
-		// side, so the VOP's write layout and MPP's read layout agree.
-		memset(&creq, 0, sizeof(creq));
-		creq.width  = buf->width;
-		creq.height = ver * 3 / 2;
-		creq.bpp    = 8;
-		ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
-		if (ret < 0) {
-			fprintf(stderr, "cannot create NV12 wb buffer (%d): %m\n", errno);
-			return -errno;
-		}
-		buf->stride = creq.pitch;
-		buf->size   = creq.size;
-		buf->handle = creq.handle;
+    memset(&creq, 0, sizeof(creq));
+    creq.width  = buf->width;
+    creq.height = ver * 3 / 2;
+    creq.bpp    = 8;
+    ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+    if (ret < 0) {
+        fprintf(stderr, "cannot create NV12 wb buffer (%d): %m\n", errno);
+        return -errno;
+    }
+    buf->stride = creq.pitch;
+    buf->size   = creq.size;
+    buf->handle = creq.handle;
 
-		handles[0] = buf->handle; pitches[0] = buf->stride; offsets[0] = 0;
-		handles[1] = buf->handle; pitches[1] = buf->stride; offsets[1] = buf->stride * ver;
-		ret = drmModeAddFB2(fd, buf->width, buf->height, DRM_FORMAT_NV12,
-				    handles, pitches, offsets, &buf->fb, 0);
-	} else {
-		// Packed 32bpp (XRGB/ARGB).
-		memset(&creq, 0, sizeof(creq));
-		creq.width  = buf->width;
-		creq.height = ver;
-		creq.bpp    = 32;
-		ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
-		if (ret < 0) {
-			fprintf(stderr, "cannot create wb buffer (%d): %m\n", errno);
-			return -errno;
-		}
-		buf->stride = creq.pitch;
-		buf->size   = creq.size;
-		buf->handle = creq.handle;
-
-		handles[0] = buf->handle; pitches[0] = buf->stride;
-		ret = drmModeAddFB2(fd, buf->width, buf->height, fourcc,
-				    handles, pitches, offsets, &buf->fb, 0);
-	}
+    handles[0] = buf->handle; pitches[0] = buf->stride; offsets[0] = 0;
+    handles[1] = buf->handle; pitches[1] = buf->stride; offsets[1] = buf->stride * ver;
+    ret = drmModeAddFB2(fd, buf->width, buf->height, DRM_FORMAT_NV12,
+                handles, pitches, offsets, &buf->fb, 0);
 
 	if (ret) {
 		fprintf(stderr, "cannot create wb framebuffer (%d): %m\n", errno);

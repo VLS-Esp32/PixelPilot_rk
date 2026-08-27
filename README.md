@@ -197,7 +197,6 @@ Specific widgets expect quite concrete facts as input:
 
 1. Video is cropped when the fpv feed resolution is bigger than the screen mode.
 2. Crashes when video feed resolution is higher than the screen resolution.
-3. DVR is working only for H256 codec. For H264 codec it doesn't record any video.
 
 ## The way it works
 
@@ -207,18 +206,20 @@ It uses [Direct Rendering Manager (DRM)](https://en.wikipedia.org/wiki/Direct_Re
 display video on the screen, see `drm.c`.
 It uses `mavlink` decoder to read Mavlink telemetry from telemetry UDP (if enabled), see `mavlink.c`
 It uses `cairo` library to draw OSD elements (if enabled), see `osd.c`.
-It writes non-decoded MPEG stream to file as DVR (if enabled) using `minimp4.h` library.
+It re-encodes decoded frames to H265 with the Rockchip hardware encoder and muxes them to mp4 as DVR
+(if enabled) using the `minimp4.h` library, so recording works regardless of the source codec.
 
 Pixelpilot starts several threads:
 
 * main thread:
-  controls rtplib which reads RTP, extracts MPEG frames and
-  - feeds them to MPP hardware decoder
-  - sends them to DVR thread via mutex-protected `std::queue` (if enabled)
+  controls rtplib which reads RTP, extracts MPEG frames and feeds them to the MPP hardware decoder
 * DVR_THREAD (if enabled):
-  reads video frames and start/stop/shutdown commands from main thread via `std::queue` and writes
-  frames them to disk using `minimp4` library.
-  It yields on a condition variable for DVR queue
+  reads frames and start/stop/shutdown commands from a mutex-protected `std::queue`, encodes each
+  frame to H265 with the MPP hardware encoder and muxes it with `minimp4`. Frames come either from
+  `FRAME_THREAD` (clean video, zero-copy from the decoder) or from `DISPLAY_THREAD` (with
+  `--dvr-osd`: the composited video+OSD output captured through the DRM writeback connector).
+  Disk writes are offloaded again to an internal writer thread so an SD stall does not drop frames.
+  It yields on a condition variable for the DVR queue
 * FRAME_THREAD:
   reads decoded video frames from MPP hardware decoder and forwards them to `DISPLAY_THREAD`
   through DRM `output_list` protected by `video_mutex`.
