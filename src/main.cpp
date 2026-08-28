@@ -683,12 +683,12 @@ void restart_mpi(MppPacket &packet, VideoCodec new_codec)
 }
 
 uint64_t first_frame_ms=0;
-void read_video_stream(MppPacket &packet, int udp_port, const char* sock) {
+void read_video_stream(MppPacket &packet, const std::string& bind_address, int port, const char* sock) {
 	std::unique_ptr<RtpReceiver> rtp_receiver;
 	if (sock) {
 		rtp_receiver = std::make_unique<RtpReceiver>(sock);
 	} else {
-		rtp_receiver = std::make_unique<RtpReceiver>(udp_port);
+		rtp_receiver = std::make_unique<RtpReceiver>(bind_address, port);
 	}
 
 	rtp_receiver->init();
@@ -788,6 +788,8 @@ void printHelp() {
     "    pixelpilot [Arguments]\n"
     "\n"
     "  Arguments:\n"
+	"    -a <address>              - Listen address for RTP video stream   (Default: 0.0.0.0)\n"
+    "\n"
     "    -p <port>                 - UDP port for RTP video stream         (Default: 5600)\n"
     "\n"
     "    --socket <socket>         - read data from socket\n"
@@ -860,6 +862,7 @@ int main(int argc, char **argv)
 	int mp4_fragmentation_mode = 0;
 	bool dvr_filenames_with_sequence = false;
 	uint16_t listen_port = 5600;
+	std::string listen_address = "0.0.0.0";
 	const char* unix_socket = NULL;
 	uint16_t wfb_port = 8003;
 	uint16_t mode_width = 0;
@@ -881,12 +884,25 @@ int main(int argc, char **argv)
 	int opt;
 	int option_index = 0;
 
-	while ((opt = getopt_long(argc, argv, "hp:", pixelpilot_long_options, &option_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "ha:p:", pixelpilot_long_options, &option_index)) != -1) {
     	switch (opt) {
 
     	case 'h':
         	printHelp();
         	return 0;
+
+		case 'a': { // -a <address>
+    		struct in_addr addr {};
+
+    		if (inet_pton(AF_INET, optarg, &addr) != 1) {
+        		spdlog::error("-a: invalid address '{}'", optarg);
+        		printHelp();
+        		return -1;
+    		}
+
+    		listen_address = optarg;
+    		break;
+		}
 
     	case 'p': { // -p <port>
         	char *end = nullptr;
@@ -1163,7 +1179,7 @@ int main(int argc, char **argv)
 
 	////////////////////////////////////////////// MAIN LOOP
 
-	read_video_stream(packet, listen_port, unix_socket);
+	read_video_stream(packet, listen_address, listen_port, unix_socket);
 
     ////////////////////////////////////////////// THREAD CLEANUP
 

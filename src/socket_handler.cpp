@@ -13,7 +13,7 @@
 #include "spdlog/spdlog.h"
 
 
-SocketHandler::SocketHandler(int port): m_port{port}
+SocketHandler::SocketHandler(const std::string& address, int port): m_port{port}, m_ip{address}
 {
 
 }
@@ -70,15 +70,14 @@ bool SocketHandler::init_internet_socket()
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY; // TODO: should we use this ?
+    // addr.sin_addr.s_addr = INADDR_ANY; // TODO: should we use this ?
     addr.sin_port = htons(m_port);
 
-    // TODO: If we use INADDR_ANY then we don't need "inet_aton"
-    // if (inet_aton(m_ip_localhost.c_str(), &addr.sin_addr) == 0) {
-    //     spdlog::error("[ SocketHandler ] Invalid IP: {}", m_ip_localhost.c_str());
-    //     close(m_socket);
-    //     return false;
-    // }
+    if (inet_pton(AF_INET, m_ip.c_str(), &addr.sin_addr) != 1) {
+        spdlog::error("[ SocketHandler ] Invalid IP: {}", m_ip);
+        close(m_socket);
+        return false;
+    }
     if (bind(m_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         close(m_socket);
@@ -86,9 +85,9 @@ bool SocketHandler::init_internet_socket()
     }
 
     // TODO: if we use specific ip as in "inet_aton"
-    // spdlog::info("[ SocketHandler ] Listening on {}:{}", m_ip_localhost.c_str(), m_port);
+    spdlog::info("[ SocketHandler ] Listening on {}:{}", m_ip.c_str(), m_port);
     // TODO: if we use INADDR_ANY -> "0.0.0.0"
-    spdlog::info("[ SocketHandler ] Listening on 0.0.0.0:{}", m_port);
+    // spdlog::info("[ SocketHandler ] Listening on 0.0.0.0:{}", m_port);
 
     return true;
 }

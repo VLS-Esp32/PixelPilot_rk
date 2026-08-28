@@ -10,7 +10,7 @@
 
 class SocketHandler {
 public:
-    explicit SocketHandler(int port);
+    explicit SocketHandler(const std::string& address, int port);
     explicit SocketHandler(const char *sock);
     ~SocketHandler();
 
@@ -23,7 +23,7 @@ private:
     int m_socket;
     int m_port;
     
-    std::string m_ip_localhost = "127.0.0.1";
+    std::string m_ip;
     std::string m_unix_socket;
 
     bool socket_connected = false;
