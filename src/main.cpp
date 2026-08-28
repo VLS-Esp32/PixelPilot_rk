@@ -649,12 +649,12 @@ void restart_mpi(MppPacket &packet, uint8_t* nal_buffer, VideoCodec new_codec)
 }
 
 uint64_t first_frame_ms=0;
-void read_video_stream(MppPacket &packet, uint8_t* nal_buffer, const std::string& udp_address, int udp_port, const char* sock) {
+void read_video_stream(MppPacket &packet, uint8_t* nal_buffer, const std::string& bind_address, int port, const char* sock) {
 	std::unique_ptr<RtpReceiver> rtp_receiver;
 	if (sock) {
 		rtp_receiver = std::make_unique<RtpReceiver>(sock);
 	} else {
-		rtp_receiver = std::make_unique<RtpReceiver>(udp_address, udp_port);
+		rtp_receiver = std::make_unique<RtpReceiver>(bind_address, port);
 	}
 
 	rtp_receiver->init();
@@ -731,7 +731,7 @@ void printHelp() {
     "    pixelpilot [Arguments]\n"
     "\n"
     "  Arguments:\n"
-	"    -a <address>           - UDP address for RTP video stream      (Default: 0.0.0.0)\n"
+	"    -a <address>           - Listen address for RTP video stream   (Default: 0.0.0.0)\n"
     "\n"
     "    -p <port>              - UDP port for RTP video stream         (Default: 5600)\n"
     "\n"
@@ -828,19 +828,17 @@ int main(int argc, char **argv)
         	return 0;
 
 		case 'a': { // -a <address>
-			int a = 0, b = 0, c = 0, d = 0;	
-			if (sscanf(optarg, "%d.%d.%d.%d", &a, &b, &c, &d) != 4 || 
-				a < 0 || a > 255 ||
-				b < 0 || b > 255 ||
-				c < 0 || c > 255 ||
-				d < 0 || d > 255) {
-				spdlog::error("-a: invalid IP address '{}'", optarg);
-				printHelp();
-				return -1;
-			}
-        	listen_address = std::string(optarg);
-        	break;
-    	}
+    		struct in_addr addr {};
+
+    		if (inet_pton(AF_INET, optarg, &addr) != 1) {
+        		spdlog::error("-a: invalid address '{}'", optarg);
+        		printHelp();
+        		return -1;
+    		}
+
+    		listen_address = optarg;
+    		break;
+		}
 
     	case 'p': { // -p <port>
         	char *end = nullptr;
