@@ -23,7 +23,6 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
@@ -65,6 +64,7 @@ struct {
 	MppApi		  *mpi;
 	
 	struct timespec first_frame_ts;
+	uint8_t 		*nal_buffer;
 
 	MppBufferGroup	frm_grp;
 	struct {
@@ -93,6 +93,7 @@ enum AppOption {
     OPT_OSD_TELEM_LVL,
     OPT_OSD_CUSTOM_MESSAGE,
     OPT_SCREEN_MODE,
+	OPT_TARGET_FRAME_RATE,
     OPT_DISABLE_VSYNC,
     OPT_SCREEN_MODE_LIST,
     OPT_WFB_API_PORT,
@@ -118,6 +119,7 @@ static const struct option pixelpilot_long_options[] = {
     {"osd-telem-lvl",       required_argument, 0, OPT_OSD_TELEM_LVL},
     {"osd-custom-message",  no_argument,       0, OPT_OSD_CUSTOM_MESSAGE},
     {"screen-mode",         required_argument, 0, OPT_SCREEN_MODE},
+    {"target-frame-rate",   required_argument, 0, OPT_TARGET_FRAME_RATE},
     {"disable-vsync",       no_argument,       0, OPT_DISABLE_VSYNC},
     {"screen-mode-list",    no_argument,       0, OPT_SCREEN_MODE_LIST},
     {"wfb-api-port",        required_argument, 0, OPT_WFB_API_PORT},
@@ -450,7 +452,7 @@ void sigusr2_handler(int signum) {
 }
 
 int decoder_stalled_count=0;
-bool feed_packet_to_decoder(MppPacket* packet, void* data_p, int data_len){
+bool feed_packet_to_decoder(MppPacket packet, void* data_p, int data_len){
     mpp_packet_set_data(packet, data_p);
     mpp_packet_set_size(packet, data_len);
     mpp_packet_set_pos(packet, data_p);
@@ -521,18 +523,20 @@ void set_mpp_decoding_parameters(MppApi* mpi, MppCtx ctx) {
     set_control_verbose(mpi,ctx,MPP_DEC_SET_PARSER_FAST_MODE,fast_mode);
 }
 
-void setup_mpi(MppPacket &packet, uint8_t* nal_buffer)
+void setup_mpi(MppPacket &packet)
 {
 	MppCodingType mpp_type = MPP_VIDEO_CodingHEVC;
-	if(codec==VideoCodec::H264) {
+	if(codec == VideoCodec::H264) {
 		mpp_type = MPP_VIDEO_CodingAVC;
 	}
 	int ret = mpp_check_support_format(MPP_CTX_DEC, mpp_type);
 	assert(!ret);
 
-	nal_buffer = (uint8_t*)malloc(1024 * 1024);
-	assert(nal_buffer);
-	ret = mpp_packet_init(&packet, nal_buffer, READ_BUF_SIZE);
+	if (!mpi.nal_buffer) {
+        mpi.nal_buffer = (uint8_t*)malloc(READ_BUF_SIZE);
+        assert(mpi.nal_buffer);
+    }
+	ret = mpp_packet_init(&packet, mpi.nal_buffer, READ_BUF_SIZE);
 	assert(!ret);
 
 	ret = mpp_create(&mpi.ctx, &mpi.mpi);
@@ -548,7 +552,7 @@ void setup_mpi(MppPacket &packet, uint8_t* nal_buffer)
 	spdlog::info("MPI setup done");
 }
 
-void cleanup_mpi(MppPacket &packet, uint8_t* nal_buffer)
+void cleanup_mpi(MppPacket &packet)
 {
 	int i;
 
@@ -574,12 +578,14 @@ void cleanup_mpi(MppPacket &packet, uint8_t* nal_buffer)
 		
 	mpp_packet_deinit(&packet);
 	mpp_destroy(mpi.ctx);
-	free(nal_buffer);
+
+	free(mpi.nal_buffer);
+	mpi.nal_buffer = NULL;
 
 	spdlog::info("MPI cleanup done");
 }
 
-int setup_drm(int print_modelist, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh)
+int setup_drm(int print_modelist, uint16_t mode_width, uint16_t mode_height, uint32_t mode_vrefresh, uint32_t target_frame_rate)
 {
 	int ret = modeset_open(&drm_fd, "/dev/dri/card0");
 	if (ret < 0) {
@@ -592,14 +598,13 @@ int setup_drm(int print_modelist, uint16_t mode_width, uint16_t mode_height, uin
 		return 0;
 	}
 
-	output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh);
+	output_list = modeset_prepare(drm_fd, mode_width, mode_height, mode_vrefresh, target_frame_rate);
 	if (!output_list) {
 		fprintf(stderr,
 				"cannot initialize display. Is display connected? Is --screen-mode correct?\n");
 		return -2;
 	}
 	return 1;
-	spdlog::info("DRM setup done");
 }
 
 void cleanup_drm()
@@ -622,7 +627,7 @@ void cleanup_drm()
 	spdlog::info("DRM cleanup done");
 }
 
-void restart_mpi(MppPacket &packet, uint8_t* nal_buffer, VideoCodec new_codec)
+void restart_mpi(MppPacket &packet, VideoCodec new_codec)
 {
 	codec_changed.store(true);
 	spdlog::info("Current codec: {} new codec: {}", codec_type_name(codec), codec_type_name(new_codec));
@@ -637,8 +642,8 @@ void restart_mpi(MppPacket &packet, uint8_t* nal_buffer, VideoCodec new_codec)
 	ret = pthread_mutex_unlock(&video_mutex);
 	assert(!ret);
 
-	cleanup_mpi(packet, nal_buffer);
-	setup_mpi(packet, nal_buffer);
+	cleanup_mpi(packet);
+	setup_mpi(packet);
 	codec_changed.store(false);
 
 
@@ -649,7 +654,7 @@ void restart_mpi(MppPacket &packet, uint8_t* nal_buffer, VideoCodec new_codec)
 }
 
 uint64_t first_frame_ms=0;
-void read_video_stream(MppPacket &packet, uint8_t* nal_buffer, const std::string& bind_address, int port, const char* sock) {
+void read_video_stream(MppPacket &packet, const std::string& bind_address, int port, const char* sock) {
 	std::unique_ptr<RtpReceiver> rtp_receiver;
 	if (sock) {
 		rtp_receiver = std::make_unique<RtpReceiver>(sock);
@@ -660,19 +665,13 @@ void read_video_stream(MppPacket &packet, uint8_t* nal_buffer, const std::string
 	rtp_receiver->init();
 	codec = rtp_receiver->get_video_codec();
 
-	setup_mpi(packet, nal_buffer);
+	setup_mpi(packet);
 	
 	codec_detected.store(true);
 
 	long long bytes_received = 0; 
 	uint64_t period_start=0;
 	auto cb=[&packet, &rtp_receiver, /*&decoder_stalled_count,*/ &bytes_received, &period_start](void *data, int size, bool is_codec_changed){
-        // Let pull thread run at quite high priority
-        static bool first= false;
-        if(first){
-            SchedulingHelper::set_thread_params_max_realtime("DisplayThread",SchedulingHelper::PRIORITY_REALTIME_LOW);
-            first= false;
-        }
 		if (is_codec_changed)
 		{
 			codec_changed.store(true);
@@ -680,7 +679,7 @@ void read_video_stream(MppPacket &packet, uint8_t* nal_buffer, const std::string
 		bytes_received += size;
 		uint64_t now = get_time_ms();
 		osd_publish_uint_fact("rtp.received_bytes", NULL, 0, size);
-        feed_packet_to_decoder((void **)packet,data,size);
+        feed_packet_to_decoder(packet, data, size);
         if (dvr_enabled && dvr != NULL && codec == VideoCodec::H265) {
 			auto frame = std::make_shared<std::vector<uint8_t>>(size);
 			std::memcpy(frame->data(), data, size);
@@ -698,13 +697,12 @@ void read_video_stream(MppPacket &packet, uint8_t* nal_buffer, const std::string
 		{
 			rtp_receiver->stop_receiving();
 			mpp_packet_set_eos(packet);
-			//mpp_packet_set_pos(packet, nal_buffer);
 			mpp_packet_set_length(packet, 0);
 			int ret=0;
 			while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
 				usleep(10000);
 			}
-			restart_mpi(packet, nal_buffer, rtp_receiver->get_video_codec());
+			restart_mpi(packet, rtp_receiver->get_video_codec());
 			rtp_receiver->start_receiving(cb);
 		}
 		else {
@@ -714,7 +712,6 @@ void read_video_stream(MppPacket &packet, uint8_t* nal_buffer, const std::string
 	rtp_receiver->stop_receiving();
     spdlog::info("Feeding eos");
     mpp_packet_set_eos(packet);
-    //mpp_packet_set_pos(packet, nal_buffer);
     mpp_packet_set_length(packet, 0);
     int ret=0;
     while (MPP_OK != (ret = mpi.mpi->decode_put_packet(mpi.ctx, packet))) {
@@ -731,52 +728,56 @@ void printHelp() {
     "    pixelpilot [Arguments]\n"
     "\n"
     "  Arguments:\n"
-	"    -a <address>           - Listen address for RTP video stream   (Default: 0.0.0.0)\n"
+	"    -a <address>              - Listen address for RTP video stream   (Default: 0.0.0.0)\n"
     "\n"
-    "    -p <port>              - UDP port for RTP video stream         (Default: 5600)\n"
+    "    -p <port>                 - UDP port for RTP video stream         (Default: 5600)\n"
     "\n"
-    "    --socket <socket>      - read data from socket\n"
+    "    --socket <socket>         - read data from socket\n"
     "\n"
-    "    --mavlink-port <port>  - UDP port for mavlink telemetry        (Default: 14550)\n"
+    "    --mavlink-port <port>     - UDP port for mavlink telemetry        (Default: 14550)\n"
     "\n"
-    "    --mavlink-dvr-on-arm   - Start recording when armed\n"
+    "    --mavlink-dvr-on-arm      - Start recording when armed\n"
     "\n"
-    "    --codec <codec>        - [ Deprecated ] Video codec, should be the same as on VTX  (Default: h265 <h264|h265>)\n"
-	"                             Now codec is detected dynamically during runtime. Passed value <codec> will ignored\n"
+    "    --codec <codec>           - [ Deprecated ] Video codec, should be the same as on VTX  (Default: h265 <h264|h265>)\n"
+	"                                Now codec is detected dynamically during runtime. Passed value <codec> will ignored\n"
     "\n"
-    "    --log-level <level>    - Log verbosity level, debug|info|warn|error (Default: info)\n"
+    "    --log-level <level>       - Log verbosity level, debug|info|warn|error (Default: info)\n"
     "\n"
-    "    --osd                  - Enable OSD\n"
+    "    --osd                     - Enable OSD\n"
     "\n"
-    "    --osd-config <file>    - Path to OSD configuration file\n"
+    "    --osd-config <file>       - Path to OSD configuration file\n"
     "\n"
-    "    --osd-refresh <rate>   - Defines the delay between osd refresh (Default: 1000 ms)\n"
+    "    --osd-refresh <rate>      - Defines the delay between osd refresh (Default: 1000 ms)\n"
     "\n"
-    "    --osd-custom-message   - Enables the display of /run/pixelpilot.msg (beta feature, may be removed)\n"
+    "    --osd-custom-message      - Enables the display of /run/pixelpilot.msg (beta feature, may be removed)\n"
     "\n"
-    "    --dvr-template <path>  - Save the video feed (no osd) to the provided filename template.\n"
-    "                             DVR is toggled by SIGUSR1 signal\n"
-    "                             Supports placeholders %%Y - year, %%m - month, %%d - day,\n"
-    "                             %%H - hour, %%M - minute, %%S - second. Ex: /media/DVR/%%Y-%%m-%%d_%%H-%%M-%%S.mp4\n"
+    "    --dvr-template <path>     - Save the video feed (no osd) to the provided filename template.\n"
+    "                                DVR is toggled by SIGUSR1 signal\n"
+    "                                Supports placeholders %%Y - year, %%m - month, %%d - day,\n"
+    "                                %%H - hour, %%M - minute, %%S - second. Ex: /media/DVR/%%Y-%%m-%%d_%%H-%%M-%%S.mp4\n"
     "\n"
-	"    --dvr-sequenced-files  - Prepend a sequence number to the names of the dvr files\n"
+	"    --dvr-sequenced-files     - Prepend a sequence number to the names of the dvr files\n"
 	"\n"
-    "    --dvr-start            - Start DVR immediately\n"
+    "    --dvr-start               - Start DVR immediately\n"
     "\n"
-    "    --dvr-framerate <rate> - Force the dvr framerate for smoother dvr, ex: 60\n"
+    "    --dvr-framerate <rate>    - Force the dvr framerate for smoother dvr, ex: 60\n"
     "\n"
-    "    --dvr-fmp4             - Save the video feed as a fragmented mp4\n"
+    "    --dvr-fmp4                - Save the video feed as a fragmented mp4\n"
     "\n"
-    "    --screen-mode <mode>   - Override default screen mode. <width>x<heigth>@<fps> ex: 1920x1080@120\n"
+    "    --screen-mode <mode>      - Override default screen mode. <width>x<heigth>@<fps> ex: 1920x1080@120\n"
     "\n"
-	"    --disable-vsync        - Disable VSYNC commits\n"
+	"    --target-frame-rate <fps> - Target DRM refresh rate for mode selection (30..120), ex: 60\n"
+	"                                Makes DRM choose the highest available resolution at the requested FPS\n"
+	"                                For optimal smoothness, use a value equal to or divisible by the video FPS.\n"
+    "\n"
+	"    --disable-vsync           - Disable VSYNC commits\n"
 	"\n"
-    "    --screen-mode-list     - Print the list of supported screen modes and exit.\n"
+    "    --screen-mode-list        - Print the list of supported screen modes and exit.\n"
     "\n"
-    "    --wfb-api-port         - Port of wfb-server for cli statistics. (Default: 8003)\n"
-	"                             Use \"0\" to disable this stats\n"
+    "    --wfb-api-port            - Port of wfb-server for cli statistics. (Default: 8003)\n"
+	"                                Use \"0\" to disable this stats\n"
     "\n"
-    "    --version              - Show program version\n"
+    "    --version                 - Show program version\n"
     "\n", APP_VERSION_MAJOR, APP_VERSION_MINOR
   );
 }
@@ -805,6 +806,7 @@ int main(int argc, char **argv)
 	uint16_t mode_width = 0;
 	uint16_t mode_height = 0;
 	uint32_t mode_vrefresh = 0;
+	uint32_t target_frame_rate = 0;
 	std::string osd_config_path;
 	auto log_level = spdlog::level::info;
 	
@@ -814,7 +816,6 @@ int main(int argc, char **argv)
     pidFile.close();
 
 	MppPacket packet;
-	uint8_t* nal_buffer = NULL;
 
 	// Load console arguments
 	int opt;
@@ -975,7 +976,19 @@ int main(int argc, char **argv)
         	break;
     	}
 
-    	case OPT_DISABLE_VSYNC: // --disable-vsync
+    	case OPT_TARGET_FRAME_RATE: { // --target-frame-rate
+        	char *end = nullptr;
+        	long v = strtol(optarg, &end, 10);
+        	if (*end != '\0' || v < 30 || v > 120) {
+            	spdlog::error("invalid --target-frame-rate '{}'", optarg);
+            	printHelp();
+            	return -1;
+        	}
+        	target_frame_rate = static_cast<uint32_t>(v);
+        	break;
+    	}
+
+		case OPT_DISABLE_VSYNC: // --disable-vsync
         	disable_vsync = true;
         	break;
 
@@ -1022,7 +1035,7 @@ int main(int argc, char **argv)
 
     ////////////////////////////////////////////// DRM SETUP
 
-	int drm_ret = setup_drm(print_modelist, mode_width, mode_height, mode_vrefresh);
+	int drm_ret = setup_drm(print_modelist, mode_width, mode_height, mode_vrefresh, target_frame_rate);
 
 	if (print_modelist) {
         remove(pidFilePath.c_str());
@@ -1097,7 +1110,7 @@ int main(int argc, char **argv)
 
 	////////////////////////////////////////////// MAIN LOOP
 
-	read_video_stream(packet, nal_buffer, listen_address, listen_port, unix_socket);
+	read_video_stream(packet, listen_address, listen_port, unix_socket);
 
     ////////////////////////////////////////////// THREAD CLEANUP
 
@@ -1136,7 +1149,7 @@ int main(int argc, char **argv)
 
 	////////////////////////////////////////////// MPI CLEANUP
 
-	cleanup_mpi(packet, nal_buffer);
+	cleanup_mpi(packet);
 
 	////////////////////////////////////////////// DRM CLEANUP
 
