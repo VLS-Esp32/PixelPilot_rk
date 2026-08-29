@@ -412,6 +412,7 @@ void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 int modeset_find_writeback(int fd, struct modeset_output *out)
 {
 	out->wb_available = false;
+    out->wb_enabled = false;
 	out->wb_connector.props = NULL;
 
 	drmModeRes *res = drmModeGetResources(fd);
@@ -569,9 +570,9 @@ void modeset_destroy_wb_fb(int fd, struct modeset_buf *buf)
 	}
 }
 
-int modeset_add_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr)
+int modeset_arm_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr)
 {
-	if (set_drm_object_property(req, &out->wb_connector, "CRTC_ID", out->crtc.id) < 0)
+    if (!out->wb_enabled)
 		return -1;
 	if (set_drm_object_property(req, &out->wb_connector, "WRITEBACK_FB_ID", wb_fb) < 0)
 		return -1;
@@ -579,6 +580,99 @@ int modeset_add_writeback(struct modeset_output *out, drmModeAtomicReq *req, uin
 				    (uint64_t)(uintptr_t)out_fence_ptr) < 0)
 		return -1;
 	return 0;
+}
+
+int modeset_attach_writeback(int fd, struct modeset_output *out)
+{
+    drmModeAtomicReq *req;
+    struct modeset_buf *buf;
+    int64_t zpos;
+    int ret;
+
+    if (!out->wb_available)
+        return -ENODEV;
+    if (out->wb_enabled)
+        return 0;
+
+    out->wb_enabled = true;
+
+    req = drmModeAtomicAlloc();
+    if (!req) {
+        out->wb_enabled = false;
+        return -ENOMEM;
+    }
+
+    buf = &out->osd_bufs[0];
+    zpos = get_property_value(fd, out->osd_plane.props, "zpos");
+    ret = modeset_perform_modeset(fd, out, req, &out->osd_plane, buf->fb,
+                        buf->width, buf->height, (int)zpos);
+    drmModeAtomicFree(req);
+
+    if (ret < 0) {
+        fprintf(stderr, "writeback attach modeset failed (%d): %m\n", ret);
+        out->wb_enabled = false;
+        return ret;
+    }
+    fprintf(stdout, "Writeback connector %u attached to CRTC %u (persistent)\n",
+        out->wb_connector.id, out->crtc.id);
+    return 0;
+}
+
+void modeset_detach_writeback(int fd, struct modeset_output *out)
+{
+    drmModeAtomicReq *req;
+
+    if (!out->wb_available)
+        return;
+
+    out->wb_enabled = false;
+
+    req = drmModeAtomicAlloc();
+    if (!req)
+        return;
+    if (set_drm_object_property(req, &out->wb_connector, "CRTC_ID", 0) > 0) {
+        if (drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) < 0)
+            fprintf(stderr, "writeback detach commit failed: %m\n");
+    }
+    drmModeAtomicFree(req);
+}
+
+int modeset_check_writeback(int fd, struct modeset_output *out, uint32_t wb_fb)
+{
+    drmModeAtomicReq *req;
+    int32_t dummy_fence = -1;
+    int ret;
+
+    req = drmModeAtomicAlloc();
+    if (!req)
+        return -ENOMEM;
+    if (set_drm_object_property(req, &out->osd_plane, "FB_ID", out->osd_bufs[0].fb) < 0) {
+        drmModeAtomicFree(req);
+        return -EINVAL;
+    }
+    ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+    drmModeAtomicFree(req);
+    if (ret < 0) {
+        fprintf(stderr, "writeback idle-commit check failed (%d): %m - this kernel appears to "
+            "require a writeback job on every commit\n", ret);
+        return ret;
+	}
+
+    req = drmModeAtomicAlloc();
+    if (!req)
+        return -ENOMEM;
+    if (set_drm_object_property(req, &out->osd_plane, "FB_ID", out->osd_bufs[0].fb) < 0 ||
+        modeset_arm_writeback(out, req, wb_fb, &dummy_fence) < 0) {
+        drmModeAtomicFree(req);
+        return -EINVAL;
+    }
+    ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+    drmModeAtomicFree(req);
+    if (ret < 0) {
+        fprintf(stderr, "writeback capture-commit check failed (%d): %m\n", ret);
+        return ret;
+    }
+    return 0;
 }
 
 int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_output *out)
@@ -878,6 +972,10 @@ int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAto
 {
 	if (set_drm_object_property(req, &out->connector, "CRTC_ID", out->crtc.id) < 0)
 		return -1;
+	if (out->wb_enabled) {
+		if (set_drm_object_property(req, &out->wb_connector, "CRTC_ID", out->crtc.id) < 0)
+			return -1;
+	}
 	if (set_drm_object_property(req, &out->crtc, "MODE_ID", out->mode_blob_id) < 0)
 		return -1;
 	if (set_drm_object_property(req, &out->crtc, "ACTIVE", 1) < 0)

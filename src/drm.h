@@ -74,6 +74,7 @@ struct modeset_output {
 
 	struct drm_object wb_connector;
 	bool wb_available;
+	bool wb_enabled;
 
 	bool cleanup;
 };
@@ -108,7 +109,13 @@ int modeset_create_wb_fb(int fd, struct modeset_buf *buf);
 
 void modeset_destroy_wb_fb(int fd, struct modeset_buf *buf);
 
-int modeset_add_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr);
+int modeset_attach_writeback(int fd, struct modeset_output *out);
+
+void modeset_detach_writeback(int fd, struct modeset_output *out);
+
+int modeset_check_writeback(int fd, struct modeset_output *out, uint32_t wb_fb);
+
+int modeset_arm_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr);
 
 int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_output *out);
 

@@ -169,15 +169,14 @@ int signal_flag = 0;
 
 // --- DVR writeback (WYSIWYG) capture pool ---
 // The VOP writes the composited display output (video + OSD planes) into these NV12 buffers, which
-// cycle between the display thread (producer) and the DVR thread (consumer). Sized one deeper than
-// the DVR's queue cap so one frame can be mid-encode while the queue is full without the display
-// finding no free buffer.
-#define WB_BUF_COUNT 4
+// cycle between the display thread (producer) and the DVR thread (consumer).
+#define WB_BUF_COUNT 6
 // Throttle for the per-frame "could not arm writeback" warning (once every N failures).
 #define WB_ARM_FAIL_WARN_INTERVAL 300
 static struct modeset_buf wb_bufs[WB_BUF_COUNT];
 static std::atomic<bool>  wb_busy[WB_BUF_COUNT];
-static bool dvr_wb_mode = false;   // writeback available AND selected for this run
+static std::atomic<bool> dvr_wb_mode{false};
+static bool wb_bufs_ready = false;
 
 static volatile sig_atomic_t dvr_toggle_request = 0;
 
@@ -302,6 +301,15 @@ void init_buffer(MppFrame frame) {
 	ret = mpi.mpi->control(mpi.ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
 
 	ret = modeset_perform_modeset(drm_fd, output_list, output_list->video_request, &output_list->video_plane, mpi.frame_to_drm[0].fb_id, output_list->video_frm_width, output_list->video_frm_height, video_zpos);
+	if (ret < 0 && dvr_wb_mode) {
+		spdlog::error("[ DVR ] modeset failed with writeback attached - detaching, DVR disabled");
+		modeset_detach_writeback(drm_fd, output_list);
+		dvr_wb_mode = false;
+		if (dvr != NULL) {
+			dvr->disable("writeback capture unavailable (display preserved)");
+		}
+		ret = modeset_perform_modeset(drm_fd, output_list, output_list->video_request, &output_list->video_plane, mpi.frame_to_drm[0].fb_id, output_list->video_frm_width, output_list->video_frm_height, video_zpos);
+	}
 	assert(ret >= 0);
 
 	// dvr setup
@@ -478,20 +486,19 @@ void *__DISPLAY_THREAD__(void *param)
         ret = set_drm_object_property(output_list->video_request, &output_list->osd_plane, "FB_ID", output_list->osd_bufs[output_list->osd_buf_switch].fb);
         assert(ret>0);
 
-        // DVR writeback (WYSIWYG) capture management. While recording, every displayed video frame
-        // is captured into a free pool buffer by (re)attaching the writeback connector with a fresh
-        // FB. A writeback connector attached to the CRTC but without a framebuffer FAILS the atomic
-        // check, so on any commit that does NOT capture we must detach it (CRTC_ID=0). We never
-        // block the display on the DVR: if no pool buffer is free we skip capture for this frame.
-        // Repeated commit failures disable the DVR centrally (DvrState::Disabled), so a broken
-        // writeback path can never freeze the live display.
-        static bool wb_attached = false;   // mirrors kernel state; only updated after a good commit
+        // DVR writeback (WYSIWYG) capture. The writeback connector is routed to the CRTC once, at
+        // startup (modeset_attach_writeback), and stays routed for the whole run. Per captured
+        // frame we only queue a writeback job (FB + out fence); routing is never touched, so the
+        // kernel never sets connectors_changed and never turns this into a modeset. Frames we do
+        // not capture simply carry no writeback properties at all: the connector state is then
+        // unchanged, no job exists, and nothing is written. We never block the display on the DVR:
+        // if no pool buffer is free we skip capture for this frame. Repeated commit failures
+        // disable the DVR centrally (DvrState::Disabled), so a broken writeback path can never
+        // freeze the live display.
         static int  wb_commit_fails = 0;
         static int  wb_arm_fails = 0;
         int     wb_idx = -1;
         int32_t wb_out_fence = -1;
-        bool    req_attach = false;   // this request attaches the WB connector with a fresh FB
-        bool    req_detach = false;   // this request detaches it
         bool    want_capture = dvr_wb_mode && dvr_is_recording() && dvr != NULL && fb_id != 0;
         if (want_capture) {
             for (int i = 0; i < WB_BUF_COUNT; i++) {
@@ -502,42 +509,22 @@ void *__DISPLAY_THREAD__(void *param)
                 }
             }
             if (wb_idx >= 0) {
-                if (modeset_add_writeback(output_list, output_list->video_request,
+                if (modeset_arm_writeback(output_list, output_list->video_request,
                                           wb_bufs[wb_idx].fb, &wb_out_fence) < 0) {
                     wb_busy[wb_idx].store(false, std::memory_order_release);
                     wb_idx = -1;
                     if (wb_arm_fails++ % WB_ARM_FAIL_WARN_INTERVAL == 0) {
-                        spdlog::warn("[ DVR ] modeset_add_writeback failed, skipping capture ({} times)",
+                        spdlog::warn("[ DVR ] modeset_arm_writeback failed, skipping capture ({} times)",
                                      wb_arm_fails);
                     }
                 } else {
-                    flags = DRM_MODE_ATOMIC_ALLOW_MODESET;   // (re)attaching may count as a modeset
-                    req_attach = true;
+                    flags &= ~DRM_MODE_ATOMIC_NONBLOCK;
                     wb_arm_fails = 0;
                 }
             }
         }
-        if (!req_attach && wb_attached) {
-            // Not capturing this commit — detach the writeback connector so the atomic check passes.
-            set_drm_object_property(output_list->video_request, &output_list->wb_connector, "CRTC_ID", 0);
-            flags = DRM_MODE_ATOMIC_ALLOW_MODESET;
-            req_detach = true;
-        }
 
         int commit_ret = drmModeAtomicCommit(drm_fd, output_list->video_request, flags, NULL);
-
-        // A failed atomic commit leaves kernel state untouched, so only mirror the request into
-        // wb_attached once the commit actually landed. Recording the intent unconditionally would
-        // leave us believing the connector is detached while the kernel still has it attached with
-        // no framebuffer — every later commit would then fail its atomic check and the live video
-        // plane would never update again.
-        if (commit_ret == 0) {
-            if (req_attach) {
-                wb_attached = true;
-            } else if (req_detach) {
-                wb_attached = false;
-            }
-        }
 
         ret = pthread_mutex_unlock(&osd_mutex);
         assert(!ret);
@@ -562,8 +549,6 @@ void *__DISPLAY_THREAD__(void *param)
                 wb_busy[wb_idx].store(false, std::memory_order_release);
                 if (++wb_commit_fails >= 3) {
                     // Centrally shut down the DVR to end recording and clear the OSD indicator.
-                    // wb_attached still reflects the kernel, so the detach branch above runs
-                    // on the next commit and leaves the connector clean. Display is untouched.
                     dvr->disable("writeback commits keep failing (display preserved)");
                 }
             }
@@ -781,6 +766,13 @@ int setup_drm(int print_modelist, uint16_t mode_width, uint16_t mode_height, uin
 	return 1;
 }
 
+static void free_wb_bufs(int count)
+{
+	for (int i = 0; i < count; i++) {
+		modeset_destroy_wb_fb(drm_fd, &wb_bufs[i]);
+	}
+}
+
 static bool setup_writeback()
 {
 	if (modeset_find_writeback(drm_fd, output_list) != 0) {
@@ -792,41 +784,42 @@ static bool setup_writeback()
 		wb_bufs[i].height = output_list->mode.vdisplay;
 		if (modeset_create_wb_fb(drm_fd, &wb_bufs[i]) != 0) {
 			spdlog::error("[ DVR ] failed to allocate writeback buffer {}", i);
-			for (int j = 0; j < i; j++) {
-				modeset_destroy_wb_fb(drm_fd, &wb_bufs[j]);
-			}
+			free_wb_bufs(i);
 			return false;
 		}
 		wb_busy[i].store(false);
 	}
-	spdlog::info("[ DVR ] writeback WYSIWYG capture enabled: {}x{}, {} buffers, format NV12",
-		     output_list->mode.hdisplay, output_list->mode.vdisplay, WB_BUF_COUNT);
+
+	if (modeset_attach_writeback(drm_fd, output_list) != 0) {
+		spdlog::error("[ DVR ] could not attach the writeback connector to CRTC {} - "
+		              "WYSIWYG recording unavailable", output_list->crtc.id);
+		free_wb_bufs(WB_BUF_COUNT);
+		return false;
+	}
+	if (modeset_check_writeback(drm_fd, output_list, wb_bufs[0].fb) != 0) {
+		spdlog::error("[ DVR ] this kernel rejects the persistent-writeback commit shape "
+		              "(see the atomic check error above) - WYSIWYG recording unavailable");
+		modeset_detach_writeback(drm_fd, output_list);
+		free_wb_bufs(WB_BUF_COUNT);
+		return false;
+	}
+
+	wb_bufs_ready = true;
+	spdlog::info("[ DVR ] writeback WYSIWYG capture enabled: {}x{}, {} buffers, format NV12, "
+	             "connector persistently attached to CRTC {}",
+	             output_list->mode.hdisplay, output_list->mode.vdisplay, WB_BUF_COUNT,
+	             output_list->crtc.id);
 	return true;
 }
 
 static void cleanup_writeback()
 {
-	if (!dvr_wb_mode) {
+	if (!wb_bufs_ready) {
 		return;
 	}
-	// Detach the writeback connector before its framebuffers go away. If the display thread exited
-	// mid-capture (e.g. SIGTERM during a recording) the connector is still attached to the CRTC;
-	// once its FB is removed, every later atomic commit — including restore_planes_zpos() — fails
-	// the atomic check with EINVAL. Detaching an already-detached connector is a harmless no-op.
-	drmModeAtomicReq *req = drmModeAtomicAlloc();
-	if (req) {
-		if (set_drm_object_property(req, &output_list->wb_connector, "CRTC_ID", 0) > 0) {
-			if (drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) < 0) {
-				spdlog::warn("[ DVR ] writeback detach commit failed: {}", strerror(errno));
-			} else {
-				spdlog::debug("[ DVR ] writeback connector detached");
-			}
-		}
-		drmModeAtomicFree(req);
-	}
-	for (int i = 0; i < WB_BUF_COUNT; i++) {
-		modeset_destroy_wb_fb(drm_fd, &wb_bufs[i]);
-	}
+	wb_bufs_ready = false;
+	modeset_detach_writeback(drm_fd, output_list);
+	free_wb_bufs(WB_BUF_COUNT);
 }
 
 void cleanup_drm()
