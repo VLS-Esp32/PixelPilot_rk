@@ -43,6 +43,8 @@ public:
 
 private:
     static const uint32_t WRITE_FAIL_WARN_INTERVAL = 300;
+    static const uint64_t SYNC_BYTES = 4 * 1024 * 1024;
+    static const int64_t  SYNC_INTERVAL_MS = 2000;
     // Cap on buffered NAL bytes. Encoded NALs are small (~KB), so this absorbs a multi-second SD
     // stall; if exceeded, the SD has been dead far too long - drop and count a failure so the DVR
     // fail-stops rather than growing memory without bound.
@@ -53,6 +55,9 @@ private:
 
     void writer_loop();
     bool drain();   // block until the queue is empty and the writer thread is idle; false on timeout
+    bool sync_now();          // fflush + fdatasync; false if either failed
+    void sync_if_due();       // sync once SYNC_BYTES or SYNC_INTERVAL_MS has passed (writer thread)
+    static void sync_dir_of(const std::string &path); // make a freshly created file's dirent durable
 
     FILE *file = nullptr;
     MP4E_mux_tag *mux = nullptr;
@@ -64,6 +69,8 @@ private:
     std::atomic<uint64_t> file_size_bytes{0};
     uint32_t write_fail_count = 0;                  // writer thread only (warn throttle)
     std::atomic<uint32_t> write_fail_streak{0};     // writer thread writes, DVR reads
+    uint64_t bytes_since_sync_ = 0;
+    int64_t  last_sync_ms_ = 0;
 
     struct NalJob { std::vector<uint8_t> data; int duration; };
     std::queue<NalJob> q_;

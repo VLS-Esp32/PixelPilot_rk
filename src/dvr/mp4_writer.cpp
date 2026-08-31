@@ -1,10 +1,20 @@
 #include <cstdlib>
+#include <ctime>
+#include <fcntl.h>
 #include <pthread.h>
+#include <unistd.h>
+#include <filesystem>
 
 #include "spdlog/spdlog.h"
 
 #include "mp4_writer.h"
 #include "../minimp4.h"
+
+static int64_t monotonic_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static int mp4_write_callback(int64_t offset, const void *buffer, size_t size, void *token) {
     return ((Mp4Writer *)token)->write_at(offset, buffer, size);
@@ -84,6 +94,8 @@ void Mp4Writer::writer_loop() {
                 write_fail_count = 0;
                 write_fail_streak.store(0, std::memory_order_relaxed);
             }
+            bytes_since_sync_ += job.data.size();
+            sync_if_due();
         }
 
         {
@@ -92,6 +104,46 @@ void Mp4Writer::writer_loop() {
         }
         qidle_.notify_all();
     }
+}
+
+bool Mp4Writer::sync_now() {
+    if (!file) {
+        return true;
+    }
+    bool ok = (fflush(file) == 0);
+    if (ok && fdatasync(fileno(file)) != 0) {
+        ok = false;
+    }
+    bytes_since_sync_ = 0;
+    last_sync_ms_ = monotonic_ms();
+    return ok;
+}
+
+void Mp4Writer::sync_if_due() {
+    int64_t now = monotonic_ms();
+    if (bytes_since_sync_ < SYNC_BYTES && now - last_sync_ms_ < SYNC_INTERVAL_MS) {
+        return;
+    }
+    if (!sync_now()) {
+        if (write_fail_count % WRITE_FAIL_WARN_INTERVAL == 0) {
+            spdlog::warn("[ DVR Mp4Writer ] flush/fdatasync failed ({} times)", write_fail_count + 1);
+        }
+        write_fail_count++;
+        write_fail_streak.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void Mp4Writer::sync_dir_of(const std::string &path) {
+    std::string dir = std::filesystem::path(path).parent_path().string();
+    if (dir.empty()) {
+        dir = ".";
+    }
+    int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        return;
+    }
+    fsync(dfd);
+    ::close(dfd);
 }
 
 bool Mp4Writer::drain() {
@@ -109,9 +161,12 @@ bool Mp4Writer::open(const std::string &path, int frag_mode) {
         spdlog::error("[ DVR Mp4Writer ] unable to open DVR file {}", path);
         return false;
     }
+    sync_dir_of(path);
     file_size_bytes.store(0, std::memory_order_relaxed);
     write_fail_count = 0;
     write_fail_streak.store(0, std::memory_order_relaxed);
+    bytes_since_sync_ = 0;
+    last_sync_ms_ = monotonic_ms();
     mux = MP4E_open(0 /*sequential_mode*/, frag_mode, this, mp4_write_callback);
     if (!mux) {
         spdlog::error("[ DVR Mp4Writer ] MP4E_open failed for {} (disk full or read-only?)", path);
@@ -178,10 +233,11 @@ bool Mp4Writer::close() {
         mux = nullptr;
     }
     mp4_h26x_write_close(writer);
+    bool sync_ok = sync_now();
     int fclose_ret = 0;
     if (file) {
         fclose_ret = fclose(file);
         file = nullptr;
     }
-    return mux_status == MP4E_STATUS_OK && fclose_ret == 0;
+    return mux_status == MP4E_STATUS_OK && sync_ok && fclose_ret == 0;
 }

@@ -246,24 +246,24 @@ void Dvr::loop() {
         switch (rpc.command) {
         case dvr_rpc::RPC_SET_PARAMS:
             spdlog::debug("[ DVR ] got rpc SET_PARAMS");
-            if (writer.is_open())
+            if (recording_armed)
                 rotate_recording_file();
             break;
         case dvr_rpc::RPC_START:
             spdlog::debug("[ DVR ] got rpc START");
-            if (writer.is_open())
+            if (recording_armed)
                 break;
             start();
             break;
         case dvr_rpc::RPC_STOP:
             spdlog::debug("[ DVR ] got rpc STOP");
-            if (writer.is_open())
+            if (recording_armed)
                 stop();
             break;
         case dvr_rpc::RPC_TOGGLE:
             spdlog::debug("[ DVR ] got rpc TOGGLE");
-            if (!writer.is_open()) {
-                start(); // encoder init postponed to RPC_FRAME, see RPC_START
+            if (!recording_armed) {
+                start();
             } else {
                 stop();
             }
@@ -312,24 +312,31 @@ void Dvr::loop() {
                 rotate_recording_file();
             }
             if (!_ready_to_write) {
-                if (writer.is_open() && video_frm_width > 0 && video_frm_height > 0) {
-                    // Bounded: a permanently broken encoder must not be rebuilt on every frame.
+                if (recording_armed && video_frm_width > 0 && video_frm_height > 0) {
                     if (init_attempts >= MAX_INIT_ATTEMPTS) {
-                        fail("encoder/muxer setup failed " + std::to_string(init_attempts) + " times",
-                             true);
+                        bool storage_fault = !writer.is_open();
+                        fail(storage_fault
+                                 ? "could not open a recording file after " +
+                                       std::to_string(init_attempts) + " attempts"
+                                 : "encoder/muxer setup failed " + std::to_string(init_attempts) +
+                                       " times",
+                             !storage_fault);
                         release_wb_frame(rpc.frame_info);
                         break;
                     }
                     init_attempts++;
-                    init();
+                    if (writer.is_open() || open_output_file()) {
+                        init();
+                    }
                     if (_ready_to_write) {
                         init_attempts = 0;
                     }
                 }
                 if (!_ready_to_write) {
-                    const char *why = !writer.is_open()      ? "no recording open"
+                    const char *why = !recording_armed      ? "not recording"
                                     : (video_frm_width == 0 || video_frm_height == 0)
                                                              ? "awaiting video params"
+                                    : !writer.is_open()      ? "could not open the recording file"
                                                              : "encoder setup failed";
                     spdlog::debug("[ DVR ] RPC_FRAME dropped: {}", why);
                     release_wb_frame(rpc.frame_info);
@@ -354,7 +361,7 @@ void Dvr::loop() {
         case dvr_rpc::RPC_DISABLE:
             // Another thread already latched Disabled and logged why; just finalize what is open.
             spdlog::debug("[ DVR ] got rpc DISABLE");
-            if (writer.is_open()) {
+            if (recording_armed) {
                 stop();
             }
             osd_publish_bool_fact("dvr.recording", NULL, 0, false);
@@ -365,7 +372,7 @@ void Dvr::loop() {
         }
     }
 end:
-    if (writer.is_open()) {
+    if (recording_armed) {
         stop();
     }
     spdlog::info("DVR thread done.");
@@ -435,14 +442,28 @@ int Dvr::start() {
         return -1;
     }
 
+    frames_submitted = 0;
+    frames_written   = 0;
+    rec_start_pts    = -1;
+    while (!submitted_pts.empty()) {
+        submitted_pts.pop();
+    }
+    init_attempts     = 0;
+    frame_error_streak = 0;
+
+    recording_armed = true;
+    osd_publish_bool_fact("dvr.recording", NULL, 0, true);
+    dvr_state.store(DvrState::Recording, std::memory_order_release);
+    return 0;
+}
+
+bool Dvr::open_output_file() {
     std::string mp4_filename = generate_filename();
     if (mp4_filename.empty()) {
-        osd_publish_bool_fact("dvr.recording", NULL, 0, false);
-        return -1;
+        return false;
     }
     if (!writer.open(mp4_filename, mp4_fragmentation_mode)) {
-        osd_publish_bool_fact("dvr.recording", NULL, 0, false);
-        return -1;
+        return false;
     }
     current_filename = mp4_filename;
 
@@ -464,19 +485,8 @@ int Dvr::start() {
                      rec_dir, dev_desc, max_file_bytes / (1024 * 1024));
     }
     spdlog::info("[ DVR ] recording to {}", current_filename);
-
-    frames_submitted = 0;
-    frames_written   = 0;
-    rec_start_pts    = -1;   // re-anchor the video clock on this segment's first frame
-    while (!submitted_pts.empty()) {
-        submitted_pts.pop();
-    }
-    init_attempts     = 0;
-    frame_error_streak = 0;
-
-    osd_publish_bool_fact("dvr.recording", NULL, 0, true);
-    dvr_state.store(DvrState::Recording, std::memory_order_release);
-    return 0;
+    last_storage_check_ms = monotonic_ms();
+    return true;
 }
 
 void Dvr::init() {
@@ -695,8 +705,10 @@ void Dvr::finalize_current_file() {
         wb_pending_index = -1;
     }
 
-    spdlog::info("[ DVR ] recording finalized: {} frames, {:.1f}s",
-                 frames_written, segment_video_ticks / 90000.0);
+    if (!current_filename.empty()) {
+        spdlog::info("[ DVR ] recording finalized: {} frames, {:.1f}s",
+                     frames_written, segment_video_ticks / 90000.0);
+    }
 
     encoder.cleanup();
 
@@ -724,6 +736,7 @@ void Dvr::finalize_current_file() {
 
 void Dvr::stop() {
     finalize_current_file();
+    recording_armed = false;
     osd_publish_bool_fact("dvr.recording", NULL, 0, false);
     DvrState expected = DvrState::Recording;
     dvr_state.compare_exchange_strong(expected, DvrState::Idle, std::memory_order_acq_rel);
@@ -747,7 +760,7 @@ void Dvr::fail(const std::string &reason, bool fatal) {
 void Dvr::rotate_recording_file() {
     finalize_current_file();
     if (start() != 0) {
-        fail("failed to open next recording file", false);
+        fail("storage not ready for the next recording file", false);
     }
 }
 

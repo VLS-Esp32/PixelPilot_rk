@@ -37,6 +37,7 @@ private:
 
     void loop();
     int  start();
+    bool open_output_file();
     void stop();
     void fail(const std::string &reason, bool fatal);
     void rotate_recording_file();
@@ -68,6 +69,8 @@ private:
     dev_t    session_dev = 0;
     bool     session_dev_known = false;
     int64_t  last_storage_check_ms = 0;
+
+    bool recording_armed = false;
 
     // Recording frame rate = the display refresh rate (the writeback recording is a screen capture,
     // so its natural rate is the display's).
