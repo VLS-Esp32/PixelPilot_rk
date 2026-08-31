@@ -530,8 +530,10 @@ void Dvr::init() {
 }
 
 int Dvr::next_frame_duration() {
+    const int default_duration = MP4_TIMEBASE_90K / enc_fps;
+
     if (submitted_pts.empty()) {
-        int d = last_good_duration > 0 ? last_good_duration : (MP4_TIMEBASE_90K / enc_fps);
+        const int d = last_good_duration > 0 ? last_good_duration : default_duration;
         segment_video_ticks += d;
         return d;
     }
@@ -547,7 +549,11 @@ int Dvr::next_frame_duration() {
         duration = 1;   // MP4 sample durations must be positive
     }
     if (duration > MAX_FRAME_DURATION_90K) {
-        duration = MAX_FRAME_DURATION_90K;
+        spdlog::warn("[ DVR ] large PTS gap: last timeline={} target={}, raw duration={}, skipping gap",
+            segment_video_ticks, target, duration);
+
+        duration = last_good_duration > 0 ? last_good_duration : default_duration;
+        segment_video_ticks = target;
     }
     last_good_duration = (int)duration;
     segment_video_ticks += duration;
