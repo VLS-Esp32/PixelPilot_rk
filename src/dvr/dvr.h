@@ -48,6 +48,7 @@ private:
     MppBuffer import_decoder_buffer(const dvr_frame_info &info);
     void encode_and_write(dvr_frame_info info);
     void encode_and_write_wb(dvr_frame_info info);
+    void update_storage_status(bool force_update);
 
     std::queue<dvr_rpc> dvrQueue;
     std::mutex mtx;
@@ -69,6 +70,12 @@ private:
     dev_t    session_dev = 0;
     bool     session_dev_known = false;
     int64_t  last_storage_check_ms = 0;
+
+    dev_t storage_status_dev = 0;
+    bool storage_status_dev_known = false;
+    uint64_t storage_total_bytes = 0;
+    bool storage_total_known = false;
+    int64_t  last_storage_status_ms = 0;
 
     bool recording_armed = false;
 

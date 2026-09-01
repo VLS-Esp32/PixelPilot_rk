@@ -227,13 +227,17 @@ void *Dvr::__THREAD__(void *param) {
 void Dvr::loop() {
     while (true) {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait(lock, [this] { return !this->dvrQueue.empty(); });
-        if (dvrQueue.empty()) {
-            break;
+        bool has_rpc = cv.wait_for(lock, std::chrono::seconds(1), [this] { return !this->dvrQueue.empty(); });      
+        if (!has_rpc) {
+            lock.unlock();
+            update_storage_status(true);
+            continue;
         }
         dvr_rpc rpc = dvrQueue.front();
         dvrQueue.pop();
         lock.unlock();
+
+        update_storage_status(false);
 
         // Once disabled, only SHUTDOWN and the DISABLE finalize still mean anything. Frames must
         // still be released or the display thread's writeback pool starves.
@@ -762,6 +766,64 @@ void Dvr::rotate_recording_file() {
     if (start() != 0) {
         fail("storage not ready for the next recording file", false);
     }
+}
+
+void Dvr::update_storage_status(bool force_update) {
+    const int64_t now_ms = monotonic_ms();
+    if (!force_update && now_ms - last_storage_status_ms < STORAGE_CHECK_INTERVAL_MS) {
+        return;
+    }
+    last_storage_status_ms = now_ms;
+
+    if (!storage.mount_ok()) {
+        if (storage_status_dev_known) {
+            spdlog::info("[ DVR ] recording storage is no longer mounted");
+        }
+        storage_status_dev_known = false;
+        storage_total_known = false;
+        osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
+        return;
+    }
+
+    dev_t now_dev = 0;
+    if (!storage.device_id(now_dev)) {
+        spdlog::warn("[ DVR ] failed to get recording storage device id");
+        storage_status_dev_known = false;
+        storage_total_known = false;
+        osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
+        return;
+    }
+    const bool new_storage = !storage_status_dev_known || now_dev != storage_status_dev;
+    uint64_t free_bytes = 0;
+
+    if (new_storage || !storage_total_known) {
+        if (!storage.space_bytes(free_bytes, storage_total_bytes)) {
+            spdlog::warn("[ DVR ] failed to get recording storage space");
+            osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
+            return;
+        }
+        storage_status_dev = now_dev;
+        storage_status_dev_known = true;
+        storage_total_known = true;
+    } else {
+        const bool same_recording_storage = session_dev_known && now_dev == session_dev;
+
+        if (writer.is_open() && session_free_known && same_recording_storage) {
+            const uint64_t written = writer.size();
+            free_bytes = session_free_at_start > written ? session_free_at_start - written : 0;
+        } else {
+            if (!storage.free_bytes(free_bytes)) {
+                spdlog::warn("[ DVR ] failed to get recording storage free space");
+                osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
+                return;
+            }
+        }
+    }
+    const bool low_space = free_bytes <= storage.min_free() || (storage_total_bytes > 0 && free_bytes < storage_total_bytes / 10);
+    const uint64_t available_bytes = free_bytes > storage.min_free() ? free_bytes - storage.min_free() : 0;
+
+    osd_publish_uint_fact("dvr.storage_free_bytes", NULL, 0, available_bytes);
+    osd_publish_uint_fact("dvr.storage_status", NULL, 0, low_space ? 2 : 1);
 }
 
 // C-compatible interface

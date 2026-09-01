@@ -878,6 +878,74 @@ public:
 	}
 };
 
+class DvrStorageWidget : public IconWidget {
+public:
+    DvrStorageWidget(int pos_x, int pos_y, cairo_surface_t *icon) :
+        IconWidget(pos_x, pos_y, icon) {
+        args.resize(2);
+    }
+
+    void draw(cairo_t *cr) override {
+        if (!args[0].isDefined()) {
+            return;
+        }
+        auto [x, y] = xy(cr);
+        const auto status = args[0].getUintValue();
+
+        CairoColor icon_color{1.0, 1.0, 1.0, 1.0};
+        std::string text = "-";
+
+        switch (status) {
+        case 0:
+            break;
+        case 1:
+            if (args[1].isDefined()) {
+                text = format_storage_size(args[1].getUintValue());
+            }
+            break;
+        case 2:
+			icon_color = CairoColor{1.0, 0.0, 0.0, 1.0};
+            if (args[1].isDefined()) {
+                text = format_storage_size(args[1].getUintValue());
+            }
+            break;
+        default:
+            return;
+        }
+        drawStrokeIcon(cr, icon, x, y - 20, icon_color, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
+        drawStrokeText(cr, x + 40, y, text, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 2.0);
+    }
+
+private:
+    static std::string format_storage_size(uint64_t bytes) {
+        struct StorageUnit {
+            uint64_t size;
+            const char *name;
+        };
+
+        static constexpr StorageUnit units[] = {
+            {1ULL << 40, "TiB"},
+            {1ULL << 30, "GiB"},
+            {1ULL << 20, "MiB"},
+            {1ULL << 10, "KiB"},
+        };
+
+        const StorageUnit *unit = &units[3];
+        for (const auto &u : units) {
+            if (bytes >= u.size) {
+                unit = &u;
+                break;
+            }
+        }
+        const double value = static_cast<double>(bytes) / unit->size;
+
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.1f %s", value, unit->name);
+
+        return buf;
+    }
+};
+
 class IconStatusWidget: public IconWidget {
 public:
 	IconStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon) :
@@ -1435,6 +1503,11 @@ public:
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
 				addWidget(new DvrStatusWidget(x, y, icon, text), matchers);
+			} else if (type == "DvrStorageWidget") {
+				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
+				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
+				if (icon == NULL) break;
+				addWidget(new DvrStorageWidget(x, y, icon), matchers);
 			} else if(type == "IconStatusWidget") {
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);

@@ -29,6 +29,7 @@ public:
     // Free space on the recording filesystem. Returns false if it could not be determined, which the
     // caller must not confuse with "no space left".
     bool free_bytes(uint64_t &out) const;
+    bool space_bytes(uint64_t &free_out, uint64_t &total_out) const;
 
 private:
     bool is_external_mount() const;

@@ -19,6 +19,16 @@ bool StorageGuard::free_bytes(uint64_t &out) const {
     return true;
 }
 
+bool StorageGuard::space_bytes(uint64_t &free_out, uint64_t &total_out) const {
+    struct statvfs vfs;
+    if (statvfs(recording_dir.c_str(), &vfs) != 0) {
+        return false;
+    }
+    free_out = (uint64_t)vfs.f_frsize * (uint64_t)vfs.f_bavail;
+    total_out = (uint64_t)vfs.f_frsize * (uint64_t)vfs.f_blocks;
+    return true;
+}
+
 bool StorageGuard::device_id(dev_t &out) const {
     struct stat sdir;
     if (stat(recording_dir.c_str(), &sdir) != 0) {
