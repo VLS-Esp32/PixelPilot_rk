@@ -356,6 +356,67 @@ end:
     spdlog::info("DVR thread done.");
 }
 
+static std::string build_sequence_pattern(const std::string &filename_pattern) {
+    std::string pattern = "^";
+    bool sequence_capture_added = false;
+
+    auto is_regex_special = [](char c) {
+        switch (c) {
+        case '.':
+        case '^':
+        case '$':
+        case '|':
+        case '(':
+        case ')':
+        case '[':
+        case ']':
+        case '{':
+        case '}':
+        case '*':
+        case '+':
+        case '?':
+        case '\\':
+            return true;      
+        }
+        return false;
+    };
+
+    for (size_t i = 0; i < filename_pattern.size(); ++i) {
+        if (filename_pattern[i] == '%' && i + 1 < filename_pattern.size()) {
+            switch (filename_pattern[i + 1]) {
+            case 'N':
+                if (!sequence_capture_added) {
+                    pattern += R"((\d+))";
+                    sequence_capture_added = true;
+                } else {
+                    pattern += R"(\d+)";
+                }
+                ++i;
+                continue;
+            case 'Y':
+                pattern += R"(\d{4})";
+                ++i;
+                continue;
+            case 'm':
+            case 'd':
+            case 'H':
+            case 'M':
+            case 'S':
+                pattern += R"(\d{2})";
+                ++i;
+                continue;
+            }
+        }
+        const char c = filename_pattern[i];
+        if (is_regex_special(c)) {
+            pattern += '\\';
+        }
+        pattern += c;
+    }
+    pattern += "$";
+    return pattern;
+}
+
 std::string Dvr::generate_filename() {
     fs::path pathObj(filename_template);
     std::string filename_pattern = pathObj.filename().string();
@@ -366,14 +427,21 @@ std::string Dvr::generate_filename() {
         return "";
     }
 
-    const bool with_sequence = filename_pattern.rfind("%N", 0) == 0;
+    const size_t sequence_pos = filename_pattern.find("%N");
+    const bool with_sequence = sequence_pos != std::string::npos;
     if (with_sequence) {
-        // Next sequence number = max existing "<digits>_..." prefix + 1. This runs on every segment
-        // rotation, so it must never throw: the card can disappear mid-scan (filesystem_error) and a
-        // long digit prefix would overflow a plain stoi - either would terminate the process.
+        const bool multiple_sequence_placeholders = filename_pattern.find("%N", sequence_pos + 2) != std::string::npos;
+        if (multiple_sequence_placeholders) {
+            spdlog::warn("[ DVR ] Filename template contains more than one %N placeholder");
+        }
+        // Next sequence number = max existing sequence matching the filename template + 1.
+        // This runs on every segment rotation, so it must never throw: the card can disappear
+        // mid-scan (filesystem_error) and a long sequence value would overflow a plain stoi - either
+        // would terminate the process.
         int maxNumber = -1;
         try {
-            std::regex pattern(R"(^(\d+)_.*)");
+            const std::string regex_pattern = build_sequence_pattern(filename_pattern);
+            std::regex pattern(regex_pattern);
             std::error_code ec;
             for (const auto &entry : fs::directory_iterator(rec_dir, ec)) {
                 std::error_code entry_ec;
@@ -393,15 +461,20 @@ std::string Dvr::generate_filename() {
                 spdlog::warn("[ DVR ] could not scan {} for sequence numbers: {}", rec_dir, ec.message());
             }
         } catch (const std::exception &e) {
-            spdlog::warn("[ DVR ] sequence scan of {} failed ({}), falling back to timestamp-only name",
-                         rec_dir, e.what());
+            spdlog::warn("[ DVR ] sequence scan of {} failed ({}), falling back to sequence 0", rec_dir, e.what());
             maxNumber = -1;
         }
         int nextFileNumber = (maxNumber == -1) ? 0 : maxNumber + 1;
 
         std::ostringstream stream;
         stream << std::setw(SEQUENCE_PADDING) << std::setfill('0') << nextFileNumber;
-        filename_pattern.replace(0, 2, stream.str());
+        const std::string sequence = stream.str();
+
+        size_t pos = 0;
+        while ((pos = filename_pattern.find("%N", pos)) != std::string::npos) {
+            filename_pattern.replace(pos, 2, sequence);
+            pos += sequence.size();
+        }
     }
 
     std::time_t now = std::time(nullptr);
