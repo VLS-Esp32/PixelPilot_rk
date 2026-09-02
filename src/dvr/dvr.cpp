@@ -76,7 +76,6 @@ Dvr::Dvr(dvr_thread_params params)
       storage(rec_dir, params.dvr_min_free_bytes, params.dvr_require_mount) {
     filename_template           = params.filename_template;
     mp4_fragmentation_mode      = params.mp4_fragmentation_mode;
-    dvr_filenames_with_sequence = params.dvr_filenames_with_sequence;
     dvr_bitrate                 = params.dvr_bitrate;
     segment_limit_ms            = (int64_t)params.dvr_segment_minutes * 60 * 1000;
     if (params.enable_osd_in_dvr && params.enable_wb) {
@@ -360,7 +359,6 @@ end:
 std::string Dvr::generate_filename() {
     fs::path pathObj(filename_template);
     std::string filename_pattern = pathObj.filename().string();
-    std::string paddedNumber = "";
 
     std::error_code dir_ec;
     if (!fs::exists(rec_dir, dir_ec)) {
@@ -368,7 +366,8 @@ std::string Dvr::generate_filename() {
         return "";
     }
 
-    if (dvr_filenames_with_sequence) {
+    const bool with_sequence = filename_pattern.rfind("%N", 0) == 0;
+    if (with_sequence) {
         // Next sequence number = max existing "<digits>_..." prefix + 1. This runs on every segment
         // rotation, so it must never throw: the card can disappear mid-scan (filesystem_error) and a
         // long digit prefix would overflow a plain stoi - either would terminate the process.
@@ -402,7 +401,7 @@ std::string Dvr::generate_filename() {
 
         std::ostringstream stream;
         stream << std::setw(SEQUENCE_PADDING) << std::setfill('0') << nextFileNumber;
-        paddedNumber = stream.str() + "_";
+        filename_pattern.replace(0, 2, stream.str());
     }
 
     std::time_t now = std::time(nullptr);
@@ -410,7 +409,7 @@ std::string Dvr::generate_filename() {
     std::strftime(formattedFilename, sizeof(formattedFilename),
                   filename_pattern.c_str(), std::localtime(&now));
 
-    return rec_dir + "/" + paddedNumber + formattedFilename;
+    return rec_dir + "/" + formattedFilename;
 }
 
 int Dvr::start() {

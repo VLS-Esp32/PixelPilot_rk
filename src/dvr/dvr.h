@@ -56,7 +56,6 @@ private:
 
     char *filename_template;
     int  mp4_fragmentation_mode = 0;
-    bool dvr_filenames_with_sequence = false;
     int  dvr_bitrate = 8000000;
     int64_t segment_limit_ms = 0;
     int64_t segment_video_ticks = 0;

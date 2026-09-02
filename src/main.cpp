@@ -83,7 +83,6 @@ enum AppOption {
     OPT_DVR,
     OPT_DVR_START,
     OPT_DVR_TEMPLATE,
-    OPT_DVR_SEQUENCED_FILES,
     OPT_DVR_FMP4,
     OPT_DVR_OSD,
     OPT_DVR_BITRATE,
@@ -114,7 +113,6 @@ static const struct option pixelpilot_long_options[] = {
     {"dvr",                 required_argument, 0, OPT_DVR},
     {"dvr-start",           no_argument,       0, OPT_DVR_START},
     {"dvr-template",        required_argument, 0, OPT_DVR_TEMPLATE},
-    {"dvr-sequenced-files", no_argument,       0, OPT_DVR_SEQUENCED_FILES},
     {"dvr-fmp4",            no_argument,       0, OPT_DVR_FMP4},
     {"dvr-osd",             no_argument,       0, OPT_DVR_OSD},
     {"dvr-bitrate",         required_argument, 0, OPT_DVR_BITRATE},
@@ -1003,11 +1001,9 @@ void printHelp() {
     "\n"
     "    --dvr-template <path>     - Save the video feed (no osd) to the provided filename template.\n"
     "                                DVR is toggled by SIGUSR1 signal\n"
-    "                                Supports placeholders %%Y - year, %%m - month, %%d - day,\n"
-    "                                %%H - hour, %%M - minute, %%S - second. Ex: /media/DVR/%%Y-%%m-%%d_%%H-%%M-%%S.mp4\n"
+    "                                Supports placeholders %%N - sequence number, %%Y - year, %%m - month, %%d - day,\n"
+    "                                %%H - hour, %%M - minute, %%S - second. Ex: /media/DVR/%%N_%%Y-%%m-%%d_%%H-%%M-%%S.mp4\n"
     "\n"
-	"    --dvr-sequenced-files     - Prepend a sequence number to the names of the dvr files\n"
-	"\n"
     "    --dvr-start               - Start DVR immediately\n"
     "\n"
     "    --dvr-fmp4                - Save the video feed as a fragmented mp4\n"
@@ -1057,7 +1053,6 @@ int main(int argc, char **argv)
 	int print_modelist = 0;
 	char* dvr_template = NULL;
 	int mp4_fragmentation_mode = 0;
-	bool dvr_filenames_with_sequence = false;
     bool dvr_enable_osd = false;
     int dvr_bitrate = 8000000;
     int dvr_segment_minutes = 0;
@@ -1124,10 +1119,6 @@ int main(int argc, char **argv)
 
     	case OPT_DVR_TEMPLATE: // --dvr-template
         	dvr_template = optarg;
-        	break;
-
-    	case OPT_DVR_SEQUENCED_FILES: // --dvr-sequenced-files
-        	dvr_filenames_with_sequence = true;
         	break;
 
     	case OPT_DVR_FMP4: // --dvr-fmp4
@@ -1365,7 +1356,6 @@ int main(int argc, char **argv)
 		dvr_thread_params args;
 		args.filename_template = dvr_template;
 		args.mp4_fragmentation_mode = mp4_fragmentation_mode;
-		args.dvr_filenames_with_sequence = dvr_filenames_with_sequence;
         args.enable_osd_in_dvr = dvr_enable_osd;
         args.dvr_bitrate = dvr_bitrate;
         args.dvr_segment_minutes = dvr_segment_minutes;
