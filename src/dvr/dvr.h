@@ -75,7 +75,8 @@ private:
     bool storage_status_dev_known = false;
     uint64_t storage_total_bytes = 0;
     bool storage_total_known = false;
-    int64_t  last_storage_status_ms = 0;
+
+    std::string recording_storage_error;
 
     bool recording_armed = false;
 

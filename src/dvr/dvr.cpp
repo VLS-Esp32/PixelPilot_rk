@@ -273,35 +273,10 @@ void Dvr::loop() {
             }
             break;
         case dvr_rpc::RPC_FRAME: {
-            // Periodic storage guard check: fail-stop if the mount vanished or free space
-            // dropped below the threshold. Uses an I/O-free estimate (free-at-start minus bytes
-            // written) rather than statvfs, which on a busy FAT32 card stalls 100ms+ and would
-            // stutter the recording. True disk-full is still caught by the write-failure fail-stop.
-            if (_ready_to_write) {
-                int64_t now_ms = monotonic_ms();
-                if (now_ms - last_storage_check_ms >= STORAGE_CHECK_INTERVAL_MS) {
-                    last_storage_check_ms = now_ms;
-                    uint64_t written = writer.size();
-                    uint64_t est_free = session_free_at_start > written ? session_free_at_start - written : 0;
-                    dev_t now_dev = 0;
-                    if (session_dev_known && (!storage.device_id(now_dev) || now_dev != session_dev)) {
-                        fail("recording storage was removed", false);
-                        release_wb_frame(rpc.frame_info);
-                        break;
-                    }
-                    if (!storage.mount_ok()) {
-                        fail("storage no longer mounted", false);
-                        release_wb_frame(rpc.frame_info);
-                        break;
-                    }
-                    if (session_free_known && !storage.has_enough_free(est_free)) {
-                        fail("low free space (~" + std::to_string(est_free / (1024 * 1024)) +
-                                 "MB left, need " + std::to_string(storage.min_free() / (1024 * 1024)) + "MB)",
-                             false);
-                        release_wb_frame(rpc.frame_info);
-                        break;
-                    }
-                }
+            if (_ready_to_write && !recording_storage_error.empty()) {
+                fail(recording_storage_error, false);
+                release_wb_frame(rpc.frame_info);
+                break;
             }
 
             // FAT32 per-file size cap: rotate before reaching the 4GB.
@@ -770,12 +745,16 @@ void Dvr::rotate_recording_file() {
 
 void Dvr::update_storage_status(bool force_update) {
     const int64_t now_ms = monotonic_ms();
-    if (!force_update && now_ms - last_storage_status_ms < STORAGE_CHECK_INTERVAL_MS) {
+    if (!force_update && now_ms - last_storage_check_ms < STORAGE_CHECK_INTERVAL_MS) {
         return;
     }
-    last_storage_status_ms = now_ms;
+    last_storage_check_ms = now_ms;
+    recording_storage_error.clear();
 
     if (!storage.mount_ok()) {
+        if (_ready_to_write) {
+            recording_storage_error = "storage no longer mounted";
+        }
         if (storage_status_dev_known) {
             spdlog::info("[ DVR ] recording storage is no longer mounted");
         }
@@ -787,12 +766,20 @@ void Dvr::update_storage_status(bool force_update) {
 
     dev_t now_dev = 0;
     if (!storage.device_id(now_dev)) {
+        if (_ready_to_write && session_dev_known) {
+            recording_storage_error = "recording storage was removed";
+        }
         spdlog::warn("[ DVR ] failed to get recording storage device id");
         storage_status_dev_known = false;
         storage_total_known = false;
         osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
         return;
     }
+    const bool same_recording_storage = session_dev_known && now_dev == session_dev;
+    if (_ready_to_write && session_dev_known && !same_recording_storage) {
+        recording_storage_error = "recording storage was removed";
+    }
+
     const bool new_storage = !storage_status_dev_known || now_dev != storage_status_dev;
     uint64_t free_bytes = 0;
 
@@ -805,20 +792,24 @@ void Dvr::update_storage_status(bool force_update) {
         storage_status_dev = now_dev;
         storage_status_dev_known = true;
         storage_total_known = true;
-    } else {
-        const bool same_recording_storage = session_dev_known && now_dev == session_dev;
+    } 
+    else if (_ready_to_write && session_free_known && same_recording_storage) {
+        const uint64_t written = writer.size();
+        free_bytes = session_free_at_start > written ? session_free_at_start - written : 0;
+    } 
+    else if (!storage.free_bytes(free_bytes)) {
+        spdlog::warn("[ DVR ] failed to get recording storage free space");
 
-        if (writer.is_open() && session_free_known && same_recording_storage) {
-            const uint64_t written = writer.size();
-            free_bytes = session_free_at_start > written ? session_free_at_start - written : 0;
-        } else {
-            if (!storage.free_bytes(free_bytes)) {
-                spdlog::warn("[ DVR ] failed to get recording storage free space");
-                osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
-                return;
-            }
-        }
+        osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
+        return;
     }
+
+    if (_ready_to_write && recording_storage_error.empty() && 
+        session_free_known && !storage.has_enough_free(free_bytes)) {
+        recording_storage_error = "low free space (~" + std::to_string(free_bytes / (1024 * 1024)) + 
+                                  "MB left, need " + std::to_string(storage.min_free() / (1024 * 1024)) + "MB)";
+    }
+
     const bool low_space = free_bytes <= storage.min_free() || (storage_total_bytes > 0 && free_bytes < storage_total_bytes / 10);
     const uint64_t available_bytes = free_bytes > storage.min_free() ? free_bytes - storage.min_free() : 0;
 
