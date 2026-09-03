@@ -21,8 +21,8 @@ set(SOURCE_FILES
         src/dvr/dvr_common.h
         src/dvr/mpp_encoder.h
         src/dvr/mpp_encoder.cpp
-        src/dvr/mp4_writer.h
-        src/dvr/mp4_writer.cpp
+        src/dvr/ts_writer.h
+        src/dvr/ts_writer.cpp
         src/dvr/storage_guard.h
         src/dvr/storage_guard.cpp
         src/dvr/dvr.h

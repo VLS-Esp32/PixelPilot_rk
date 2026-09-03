@@ -8,7 +8,7 @@
 
 #include "dvr_common.h"
 #include "mpp_encoder.h"
-#include "mp4_writer.h"
+#include "ts_writer.h"
 #include "storage_guard.h"
 
 class Dvr {
@@ -55,7 +55,6 @@ private:
     std::condition_variable cv;
 
     char *filename_template;
-    int  mp4_fragmentation_mode = 0;
     int  dvr_bitrate = 8000000;
     int64_t segment_limit_ms = 0;
     int64_t segment_video_ticks = 0;
@@ -99,7 +98,7 @@ private:
     int frame_error_streak = 0;   // consecutive frames lost to import/fence/submit errors
 
     MppEncoder    encoder;
-    Mp4Writer     writer;
+    TsWriter      writer;
 
     std::string current_filename;
 

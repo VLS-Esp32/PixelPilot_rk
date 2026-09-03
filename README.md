@@ -208,8 +208,9 @@ It uses [Direct Rendering Manager (DRM)](https://en.wikipedia.org/wiki/Direct_Re
 display video on the screen, see `drm.c`.
 It uses `mavlink` decoder to read Mavlink telemetry from telemetry UDP (if enabled), see `mavlink.c`
 It uses `cairo` library to draw OSD elements (if enabled), see `osd.c`.
-It re-encodes decoded frames to H265 with the Rockchip hardware encoder and muxes them to mp4 as DVR
-(if enabled) using the `minimp4.h` library, so recording works regardless of the source codec.
+It re-encodes decoded frames to H265 with the Rockchip hardware encoder and muxes them to MPEG-TS as
+DVR (if enabled), so recording works regardless of the source codec. TS is append-only and carries
+no index, so a recording cut short by a power loss stays playable up to the last flushed byte.
 
 Pixelpilot starts several threads:
 
@@ -217,7 +218,7 @@ Pixelpilot starts several threads:
   controls rtplib which reads RTP, extracts MPEG frames and feeds them to the MPP hardware decoder
 * DVR_THREAD (if enabled):
   reads frames and start/stop/shutdown commands from a mutex-protected `std::queue`, encodes each
-  frame to H265 with the MPP hardware encoder and muxes it with `minimp4`. Frames come either from
+  frame to H265 with the MPP hardware encoder and muxes it to MPEG-TS. Frames come either from
   `FRAME_THREAD` (clean video, zero-copy from the decoder) or from `DISPLAY_THREAD` (with
   `--dvr-osd`: the composited video+OSD output captured through the DRM writeback connector).
   Disk writes are offloaded again to an internal writer thread so an SD stall does not drop frames.

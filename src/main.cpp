@@ -1002,11 +1002,11 @@ void printHelp() {
     "    --dvr-template <path>     - Save the video feed (no osd) to the provided filename template.\n"
     "                                DVR is toggled by SIGUSR1 signal\n"
     "                                Supports placeholders %%N - sequence number, %%Y - year, %%m - month, %%d - day,\n"
-    "                                %%H - hour, %%M - minute, %%S - second. Ex: /media/DVR/%%N_%%Y-%%m-%%d_%%H-%%M-%%S.mp4\n"
+    "                                %%H - hour, %%M - minute, %%S - second. Ex: /media/DVR/%%N_%%Y-%%m-%%d_%%H-%%M-%%S.ts\n"
     "\n"
     "    --dvr-start               - Start DVR immediately\n"
     "\n"
-    "    --dvr-fmp4                - Save the video feed as a fragmented mp4\n"
+    "    --dvr-fmp4                - Deprecated and ignored (the DVR records MPEG-TS)\n"
     "\n"
     "    --dvr-osd                 - Burn OSD into DVR recording (WYSIWYG via DRM writeback)\n"
     "\n"
@@ -1052,7 +1052,6 @@ int main(int argc, char **argv)
 	bool mavlink_thread = false;
 	int print_modelist = 0;
 	char* dvr_template = NULL;
-	int mp4_fragmentation_mode = 0;
     bool dvr_enable_osd = false;
     int dvr_bitrate = 8000000;
     int dvr_segment_minutes = 0;
@@ -1121,8 +1120,8 @@ int main(int argc, char **argv)
         	dvr_template = optarg;
         	break;
 
-    	case OPT_DVR_FMP4: // --dvr-fmp4
-        	mp4_fragmentation_mode = 1;
+    	case OPT_DVR_FMP4: // --dvr-fmp4 (deprecated)
+        	spdlog::warn("--dvr-fmp4 is deprecated and ignored: the DVR records MPEG-TS");
         	break;
 
         case OPT_DVR_OSD: // --dvr-osd
@@ -1355,7 +1354,6 @@ int main(int argc, char **argv)
 	if (dvr_requested) {
 		dvr_thread_params args;
 		args.filename_template = dvr_template;
-		args.mp4_fragmentation_mode = mp4_fragmentation_mode;
         args.enable_osd_in_dvr = dvr_enable_osd;
         args.dvr_bitrate = dvr_bitrate;
         args.dvr_segment_minutes = dvr_segment_minutes;
@@ -1466,7 +1464,7 @@ int main(int argc, char **argv)
 
     remove(pidFilePath.c_str());
 
-    // Every thread that reads `dvr` has been joined, and ~Mp4Writer joins the mp4 writer
+    // Every thread that reads `dvr` has been joined, and ~TsWriter joins the TS writer
     // thread, which can block if storage is wedged. Doing it here means such a hang costs only this
     // process's own exit - the display has already been restored and the DRM state cleaned up.
     delete dvr;

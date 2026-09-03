@@ -36,14 +36,14 @@ static const int SEQUENCE_PADDING = 4;   // zero-padding width for sequence-numb
 // Keeping this small bounds DVR lateness to a few frames, well inside the recycle window.
 static const size_t DVR_MAX_PENDING_FRAMES = 3;
 
-static const int MP4_TIMEBASE_90K = 90000;  // minimp4 timescale (ticks per second)
-static const int MS_TO_90K        = 90;     // 1 ms = 90 ticks at 90kHz
+static const int TS_TIMEBASE_90K = 90000;  // MPEG-TS clock (ticks per second)
+static const int MS_TO_90K       = 90;     // 1 ms = 90 ticks at 90kHz
 
-// Cap on a single frame's MP4 duration (90k ticks). A drop burst (e.g. frames lost while the DVR
+// Cap on a single frame's duration (90k ticks). A drop burst (e.g. frames lost while the DVR
 // thread blocks on segment rotation) leaves a large pts gap; without this cap the resulting frame
 // would be held for seconds - a freeze. 0.25s is far above any real inter-frame gap, so normal
 // frames are unaffected; it only bounds the pathological case.
-static const int MAX_FRAME_DURATION_90K = MP4_TIMEBASE_90K / 4;
+static const int MAX_FRAME_DURATION_90K = TS_TIMEBASE_90K / 4;
 
 //Periodic storage guard check runs during recording (free-space / mount check).
 static const int64_t  STORAGE_CHECK_INTERVAL_MS = 3000;
@@ -75,7 +75,6 @@ Dvr::Dvr(dvr_thread_params params)
     : rec_dir(fs::path(params.filename_template).parent_path().string()),
       storage(rec_dir, params.dvr_min_free_bytes, params.dvr_require_mount) {
     filename_template           = params.filename_template;
-    mp4_fragmentation_mode      = params.mp4_fragmentation_mode;
     dvr_bitrate                 = params.dvr_bitrate;
     segment_limit_ms            = (int64_t)params.dvr_segment_minutes * 60 * 1000;
     if (params.enable_osd_in_dvr && params.enable_wb) {
@@ -509,14 +508,14 @@ int Dvr::start() {
 }
 
 bool Dvr::open_output_file() {
-    std::string mp4_filename = generate_filename();
-    if (mp4_filename.empty()) {
+    std::string ts_filename = generate_filename();
+    if (ts_filename.empty()) {
         return false;
     }
-    if (!writer.open(mp4_filename, mp4_fragmentation_mode)) {
+    if (!writer.open(ts_filename)) {
         return false;
     }
-    current_filename = mp4_filename;
+    current_filename = ts_filename;
 
     max_file_bytes = storage.file_size_cap();
     session_dev_known  = storage.device_id(session_dev);
@@ -553,7 +552,7 @@ void Dvr::init() {
     _ready_to_write = 0;
     encoder.cleanup();
 
-    int enc_w, enc_h, enc_hor, enc_ver, mp4_w, mp4_h;
+    int enc_w, enc_h, enc_hor, enc_ver, mux_w, mux_h;
     if (mode == RecordingMode::VideoWithOsdWriteback) {
         // The display thread captures the composited output (video + OSD) the VOP wrote into the
         // writeback buffers at display resolution. Encoder geometry is fixed to those buffers.
@@ -561,8 +560,8 @@ void Dvr::init() {
         enc_h = (int)wb_enc_height;
         enc_hor = (int)wb_enc_hor_stride;
         enc_ver = (int)wb_enc_ver_stride;
-        mp4_w = (int)wb_enc_width;
-        mp4_h = (int)wb_enc_height;
+        mux_w = (int)wb_enc_width;
+        mux_h = (int)wb_enc_height;
         spdlog::info("[ DVR ] setting up dvr encoder {}x{} @{}fps bitrate={} H265 [writeback WYSIWYG]",
                      wb_enc_width, wb_enc_height, fps, dvr_bitrate);
     }
@@ -571,8 +570,8 @@ void Dvr::init() {
         enc_h = (int)video_frm_height;
         enc_hor = (int)((video_frm_width  + 15) & ~15u);
         enc_ver = (int)((video_frm_height + 15) & ~15u);
-        mp4_w = (int)video_frm_width;
-        mp4_h = (int)video_frm_height;
+        mux_w = (int)video_frm_width;
+        mux_h = (int)video_frm_height;
         spdlog::info("[ DVR ] setting up dvr encoder {}x{} @{}fps bitrate={} H265 [zero-copy]",
                      video_frm_width, video_frm_height, fps, dvr_bitrate);
     }
@@ -581,7 +580,7 @@ void Dvr::init() {
         return;
     }
 
-    if (!writer.begin_video(mp4_w, mp4_h)) {
+    if (!writer.begin_video(mux_w, mux_h)) {
         encoder.cleanup();
         return;
     }
@@ -591,7 +590,7 @@ void Dvr::init() {
 }
 
 int Dvr::next_frame_duration() {
-    const int default_duration = MP4_TIMEBASE_90K / enc_fps;
+    const int default_duration = TS_TIMEBASE_90K / enc_fps;
 
     if (submitted_pts.empty()) {
         const int d = last_good_duration > 0 ? last_good_duration : default_duration;
@@ -768,7 +767,8 @@ void Dvr::finalize_current_file() {
     _ready_to_write = 0;
 
     if (!empty && !finalized_ok && !current_filename.empty()) {
-        spdlog::error("[ DVR ] recording incomplete (index/moov write failed): {} — may need repair",
+        spdlog::error("[ DVR ] recording truncated (storage stopped responding): {} — "
+                      "playable up to the last flushed frame",
                       current_filename);
     }
 
