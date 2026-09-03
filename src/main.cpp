@@ -311,12 +311,11 @@ void init_buffer(MppFrame frame) {
 	assert(ret >= 0);
 
 	// dvr setup
-	if (dvr != NULL){
-        dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height);
+	if (dvr != NULL){     
         // A resolution change start new recording session
         if (prev_frm_width != output_list->video_frm_width ||
             prev_frm_height != output_list->video_frm_height) {
-            dvr->restart();
+            dvr->set_video_params(output_list->video_frm_width, output_list->video_frm_height);
         }
 	}
 }

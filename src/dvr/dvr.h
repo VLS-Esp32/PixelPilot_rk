@@ -32,7 +32,7 @@ public:
 
     static void *__THREAD__(void *context);
 private:
-    void enqueue_dvr_command(dvr_rpc rpc);
+    void enqueue_dvr_command(dvr_rpc rpc, bool drop_frames);
     void drop_pending_frames();
 
     void loop();

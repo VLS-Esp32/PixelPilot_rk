@@ -155,36 +155,25 @@ void Dvr::drop_pending_frames() {
 }
 
 void Dvr::set_video_params(uint32_t video_frm_w, uint32_t video_frm_h) {
-    std::lock_guard<std::mutex> lock(mtx);
-    video_frm_width = video_frm_w;
-    video_frm_height = video_frm_h;
-    drop_pending_frames();
+    enqueue_dvr_command({ .command = dvr_rpc::RPC_SET_PARAMS, .video_p = { video_frm_w, video_frm_h }}, true);
 }
 
 void Dvr::restart() {
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        drop_pending_frames();
-        dvrQueue.push({ .command = dvr_rpc::RPC_SET_PARAMS });
-    }
-    cv.notify_one();
+    enqueue_dvr_command({ .command = dvr_rpc::RPC_RESTART }, true);
 }
 
 void Dvr::start_recording() {
-    enqueue_dvr_command({ .command = dvr_rpc::RPC_START });
+    enqueue_dvr_command({ .command = dvr_rpc::RPC_START }, false);
 }
 
 void Dvr::stop_recording() {
     DvrState expected = DvrState::Recording;
     dvr_state.compare_exchange_strong(expected, DvrState::Idle, std::memory_order_acq_rel);
-    std::lock_guard<std::mutex> lock(mtx);
-    drop_pending_frames();
-    dvrQueue.push({ .command = dvr_rpc::RPC_STOP });
-    cv.notify_one();
+    enqueue_dvr_command({ .command = dvr_rpc::RPC_STOP }, true);
 }
 
 void Dvr::toggle_recording() {
-    enqueue_dvr_command({ .command = dvr_rpc::RPC_TOGGLE });
+    enqueue_dvr_command({ .command = dvr_rpc::RPC_TOGGLE }, false);
 }
 
 void Dvr::disable(const std::string &reason) {
@@ -193,24 +182,21 @@ void Dvr::disable(const std::string &reason) {
         return;
     }
     spdlog::error("[ DVR ] disabling DVR for this session: {}", reason);
-    std::lock_guard<std::mutex> lock(mtx);
-    drop_pending_frames();
-    dvrQueue.push({ .command = dvr_rpc::RPC_DISABLE });
-    cv.notify_one();
+    enqueue_dvr_command({ .command = dvr_rpc::RPC_DISABLE }, true);
 }
 
 void Dvr::shutdown() {
     DvrState expected = DvrState::Recording;
     dvr_state.compare_exchange_strong(expected, DvrState::Idle, std::memory_order_acq_rel);
-    std::lock_guard<std::mutex> lock(mtx);
-    drop_pending_frames();
-    dvrQueue.push({ .command = dvr_rpc::RPC_SHUTDOWN });
-    cv.notify_one();
+    enqueue_dvr_command({ .command = dvr_rpc::RPC_SHUTDOWN }, true);
 }
 
-void Dvr::enqueue_dvr_command(dvr_rpc rpc) {
+void Dvr::enqueue_dvr_command(dvr_rpc rpc, bool drop_frames) {
     {
         std::lock_guard<std::mutex> lock(mtx);
+        if (drop_frames) {
+            drop_pending_frames();
+        }
         dvrQueue.push(rpc);
     }
     cv.notify_one();
@@ -248,6 +234,11 @@ void Dvr::loop() {
         switch (rpc.command) {
         case dvr_rpc::RPC_SET_PARAMS:
             spdlog::debug("[ DVR ] got rpc SET_PARAMS");
+            video_frm_width = rpc.video_p.video_frm_width;
+            video_frm_height = rpc.video_p.video_frm_height;
+            [[fallthrough]];
+        case dvr_rpc::RPC_RESTART:
+            spdlog::debug("[ DVR ] got rpc RPC_RESTART");
             if (recording_armed)
                 rotate_recording_file();
             break;

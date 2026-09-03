@@ -53,9 +53,11 @@ struct dvr_rpc {
         RPC_TOGGLE,
         RPC_SHUTDOWN,
         RPC_SET_PARAMS,
+        RPC_RESTART,
         RPC_DISABLE     // another thread hit an unrecoverable DVR fault; finalize and stay off
     } command;
     dvr_frame_info frame_info;
+    video_params video_p;
 };
 
 enum class RecordingMode {
