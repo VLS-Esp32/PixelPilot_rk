@@ -74,8 +74,6 @@ private:
     uint64_t storage_total_bytes = 0;
     bool storage_total_known = false;
 
-    std::string recording_storage_error;
-
     bool recording_armed = false;
 
     // Recording frame rate = the display refresh rate (the writeback recording is a screen capture,

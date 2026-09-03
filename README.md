@@ -185,7 +185,7 @@ Specific widgets expect quite concrete facts as input:
 * `DvrStatusWidget` - shows up when DVR is recording and is hidden when not.
   Uses `dvr.recording` fact
 * `DvrStorageWidget` - shows available DVR storage space and displays an error state when storage is unavailable or low on space.
-  Uses `dvr.storage_status` and `dvr.storage_free_bytes` facts.
+  Uses `dvr.storage_status` and `dvr.storage_available_bytes` facts.
 * `VideoWidget` - shows FPS and video resolution.
   Uses `video.displayed_frame`, `video.width`, `video.height` facts
 * `VideoBitrateWidget` - shows video bitrate (not radio link, but video!).

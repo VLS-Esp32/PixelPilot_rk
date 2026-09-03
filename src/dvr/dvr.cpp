@@ -271,12 +271,6 @@ void Dvr::loop() {
             }
             break;
         case dvr_rpc::RPC_FRAME: {
-            if (_ready_to_write && !recording_storage_error.empty()) {
-                fail(recording_storage_error, false);
-                release_wb_frame(rpc.frame_info);
-                break;
-            }
-
             // FAT32 per-file size cap: rotate before reaching the 4GB.
             if (_ready_to_write && max_file_bytes > 0 && writer.size() >= max_file_bytes) {
                 spdlog::info("[ DVR ] file size cap reached, starting new file");
@@ -359,55 +353,26 @@ static std::string build_sequence_pattern(const std::string &filename_pattern) {
     std::string pattern = "^";
     bool sequence_capture_added = false;
 
-    auto is_regex_special = [](char c) {
-        switch (c) {
-        case '.':
-        case '^':
-        case '$':
-        case '|':
-        case '(':
-        case ')':
-        case '[':
-        case ']':
-        case '{':
-        case '}':
-        case '*':
-        case '+':
-        case '?':
-        case '\\':
-            return true;      
-        }
-        return false;
-    };
-
     for (size_t i = 0; i < filename_pattern.size(); ++i) {
         if (filename_pattern[i] == '%' && i + 1 < filename_pattern.size()) {
-            switch (filename_pattern[i + 1]) {
-            case 'N':
+            const char spec = filename_pattern[i + 1];
+            if (spec == 'N') {
                 if (!sequence_capture_added) {
                     pattern += R"((\d+))";
                     sequence_capture_added = true;
                 } else {
                     pattern += R"(\d+)";
                 }
-                ++i;
-                continue;
-            case 'Y':
+            } else if (spec == 'Y') {
                 pattern += R"(\d{4})";
-                ++i;
-                continue;
-            case 'm':
-            case 'd':
-            case 'H':
-            case 'M':
-            case 'S':
+            } else {
                 pattern += R"(\d{2})";
-                ++i;
-                continue;
             }
+            ++i;
+            continue;
         }
         const char c = filename_pattern[i];
-        if (is_regex_special(c)) {
+        if (std::strchr(".^$|()[]{}*+?\\", c)) {
             pattern += '\\';
         }
         pattern += c;
@@ -821,11 +786,10 @@ void Dvr::update_storage_status(bool force_update) {
         return;
     }
     last_storage_check_ms = now_ms;
-    recording_storage_error.clear();
 
     if (!storage.mount_ok()) {
         if (_ready_to_write) {
-            recording_storage_error = "storage no longer mounted";
+            fail("storage no longer mounted", false);
         }
         if (storage_status_dev_known) {
             spdlog::info("[ DVR ] recording storage is no longer mounted");
@@ -839,7 +803,7 @@ void Dvr::update_storage_status(bool force_update) {
     dev_t now_dev = 0;
     if (!storage.device_id(now_dev)) {
         if (_ready_to_write && session_dev_known) {
-            recording_storage_error = "recording storage was removed";
+            fail("recording storage was removed", false);
         }
         spdlog::warn("[ DVR ] failed to get recording storage device id");
         storage_status_dev_known = false;
@@ -849,14 +813,14 @@ void Dvr::update_storage_status(bool force_update) {
     }
     const bool same_recording_storage = session_dev_known && now_dev == session_dev;
     if (_ready_to_write && session_dev_known && !same_recording_storage) {
-        recording_storage_error = "recording storage was removed";
+        fail("recording storage was removed", false);
     }
 
     const bool new_storage = !storage_status_dev_known || now_dev != storage_status_dev;
-    uint64_t free_bytes = 0;
+    uint64_t available_bytes = 0;
 
     if (new_storage || !storage_total_known) {
-        if (!storage.space_bytes(free_bytes, storage_total_bytes)) {
+        if (!storage.space_bytes(available_bytes, storage_total_bytes)) {
             spdlog::warn("[ DVR ] failed to get recording storage space");
             osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
             return;
@@ -867,25 +831,26 @@ void Dvr::update_storage_status(bool force_update) {
     } 
     else if (_ready_to_write && session_free_known && same_recording_storage) {
         const uint64_t written = writer.size();
-        free_bytes = session_free_at_start > written ? session_free_at_start - written : 0;
+        available_bytes = session_free_at_start > written ? session_free_at_start - written : 0;
     } 
-    else if (!storage.free_bytes(free_bytes)) {
+    else if (!storage.free_bytes(available_bytes)) {
         spdlog::warn("[ DVR ] failed to get recording storage free space");
 
         osd_publish_uint_fact("dvr.storage_status", NULL, 0, 0);
         return;
     }
 
-    if (_ready_to_write && recording_storage_error.empty() && 
-        session_free_known && !storage.has_enough_free(free_bytes)) {
-        recording_storage_error = "low free space (~" + std::to_string(free_bytes / (1024 * 1024)) + 
-                                  "MB left, need " + std::to_string(storage.min_free() / (1024 * 1024)) + "MB)";
+    if (_ready_to_write && session_free_known && !storage.has_enough_free(available_bytes)) {
+        fail("low free space (~" + std::to_string(available_bytes / (1024 * 1024)) +
+                                 "MB left, need " + std::to_string(storage.min_free() / (1024 * 1024)) + "MB)",
+                             false);
     }
 
-    const bool low_space = free_bytes <= storage.min_free() || (storage_total_bytes > 0 && free_bytes < storage_total_bytes / 10);
-    const uint64_t available_bytes = free_bytes > storage.min_free() ? free_bytes - storage.min_free() : 0;
+    const bool low_space = available_bytes <= storage.min_free() || 
+                           (storage_total_bytes > 0 && available_bytes < storage_total_bytes / 10);
+    const uint64_t dvr_available_bytes = available_bytes > storage.min_free() ? available_bytes - storage.min_free() : 0;
 
-    osd_publish_uint_fact("dvr.storage_free_bytes", NULL, 0, available_bytes);
+    osd_publish_uint_fact("dvr.storage_available_bytes", NULL, 0, dvr_available_bytes);
     osd_publish_uint_fact("dvr.storage_status", NULL, 0, low_space ? 2 : 1);
 }
 
