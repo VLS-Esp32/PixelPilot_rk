@@ -227,7 +227,9 @@ void Dvr::loop() {
         // still be released or the display thread's writeback pool starves.
         if (dvr_is_disabled() &&
             rpc.command != dvr_rpc::RPC_SHUTDOWN && rpc.command != dvr_rpc::RPC_DISABLE) {
-            release_wb_frame(rpc.frame_info);
+            if (rpc.command == dvr_rpc::RPC_FRAME) {
+                release_wb_frame(rpc.frame_info);
+            }
             continue;
         }
 

@@ -83,7 +83,6 @@ enum AppOption {
     OPT_DVR,
     OPT_DVR_START,
     OPT_DVR_TEMPLATE,
-    OPT_DVR_FMP4,
     OPT_DVR_OSD,
     OPT_DVR_BITRATE,
     OPT_DVR_SEGMENT_TIME,
@@ -113,7 +112,6 @@ static const struct option pixelpilot_long_options[] = {
     {"dvr",                 required_argument, 0, OPT_DVR},
     {"dvr-start",           no_argument,       0, OPT_DVR_START},
     {"dvr-template",        required_argument, 0, OPT_DVR_TEMPLATE},
-    {"dvr-fmp4",            no_argument,       0, OPT_DVR_FMP4},
     {"dvr-osd",             no_argument,       0, OPT_DVR_OSD},
     {"dvr-bitrate",         required_argument, 0, OPT_DVR_BITRATE},
     {"dvr-segment-time",    required_argument, 0, OPT_DVR_SEGMENT_TIME},
@@ -1005,8 +1003,6 @@ void printHelp() {
     "\n"
     "    --dvr-start               - Start DVR immediately\n"
     "\n"
-    "    --dvr-fmp4                - Deprecated and ignored (the DVR records MPEG-TS)\n"
-    "\n"
     "    --dvr-osd                 - Burn OSD into DVR recording (WYSIWYG via DRM writeback)\n"
     "\n"
     "    --dvr-bitrate <bps>       - Target bitrate for DVR re-encoding (Default: 8000000)\n"
@@ -1117,10 +1113,6 @@ int main(int argc, char **argv)
 
     	case OPT_DVR_TEMPLATE: // --dvr-template
         	dvr_template = optarg;
-        	break;
-
-    	case OPT_DVR_FMP4: // --dvr-fmp4 (deprecated)
-        	spdlog::warn("--dvr-fmp4 is deprecated and ignored: the DVR records MPEG-TS");
         	break;
 
         case OPT_DVR_OSD: // --dvr-osd
