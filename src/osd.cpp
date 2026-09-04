@@ -18,6 +18,7 @@ extern "C" {
 #include <chrono>
 #include <deque>
 #include <cstdlib> //KILLME
+#include <ctime>
 #include <string>
 #include <filesystem>
 #include <cairo.h>
@@ -400,6 +401,8 @@ public:
 			args.push_back(Fact());
 		}
 	};
+
+	virtual ~Widget() = default;
 
 	virtual void draw(cairo_t *cr) {};
 
@@ -1115,6 +1118,45 @@ public:
 	}
 };
 
+class TimeWidget : public Widget {
+public:
+	TimeWidget(int pos_x, int pos_y, uint num_args) : 
+		Widget(pos_x, pos_y, num_args) {}
+	~TimeWidget() override = default;
+
+	void draw(cairo_t* cr) override {
+        updateTime();
+
+        auto [x, y] = xy(cr);
+        drawStrokeText(cr, x, y, time_, CairoColor{0.8, 0.8, 0.8, 1}, CairoColor{0, 0, 0, 1}, 1.0);
+    }
+
+private:
+	void updateTime() {
+		const auto now = std::chrono::steady_clock::now();
+        if (now - last_update_ < std::chrono::seconds(1)) {
+            return;
+        }
+		
+        last_update_ = now;
+        const auto system_now = std::chrono::system_clock::now();
+        const std::time_t time =std::chrono::system_clock::to_time_t(system_now);
+
+        std::tm tm{};
+        if (localtime_r(&time, &tm) == nullptr) {
+            return;
+        }
+
+        char buffer[20];
+        if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm) == 0) {
+            return;
+        }
+        time_ = buffer;
+	}
+
+	std::chrono::steady_clock::time_point last_update_{};
+	std::string time_;
+};
 
 class DebugWidget: public Widget {
 public:
@@ -1513,6 +1555,8 @@ public:
 						  matchers);
 			} else if (type == "GPSWidget") {
 				addWidget(new GPSWidget(x, y, (uint)matchers.size()), matchers);
+			} else if (type == "TimeWidget") {
+				addWidget(new TimeWidget(x, y, (uint)matchers.size()), matchers);
 			} else if(type == "PopupWidget") {
 				auto timeout_ms = widget_j.at("timeout_ms").template get<uint>();
 				addWidget(new PopupWidget(x, y, timeout_ms, (uint)matchers.size()),
