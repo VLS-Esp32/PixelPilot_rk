@@ -599,11 +599,10 @@ MppBuffer Dvr::import_decoder_buffer(const dvr_frame_info &info) {
 }
 
 void Dvr::maybe_request_idr() {
-    if (segment_video_ticks - last_idr_ticks < KEYFRAME_INTERVAL_90K) {
-        return;
+    if (frames_submitted == 0 || segment_video_ticks - last_idr_ticks >= KEYFRAME_INTERVAL_90K) {
+        encoder.request_idr();
+        last_idr_ticks = segment_video_ticks;
     }
-    encoder.request_idr();
-    last_idr_ticks = segment_video_ticks;
 }
 
 void Dvr::encode_and_write_wb(dvr_frame_info info) {
