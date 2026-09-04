@@ -53,10 +53,11 @@
       ]
     },
     {
+      "id": "dvr_storage",
       "name": "DVR storage",
       "type": "DvrStorageWidget",
-      "x": 850,
-      "y": -24,
+      "x": 0,
+      "y": 0,
       "icon_path": "hard-drive.png",
       "facts": [
         { "name": "dvr.storage_status" },
@@ -86,10 +87,11 @@
       ]
     },
     {
+      "id": "dvr_status",
       "name": "DVR status",
       "type": "DvrStatusWidget",
-      "x": -90,
-      "y": 35,
+      "x": 0,
+      "y": 0,
       "icon_path": "sdcard-white.png",
       "text": "Rec",
       "facts": [
@@ -105,5 +107,18 @@
       "height": 0,
       "facts": []
     }
-  ]
+  ],
+  "layouts": [
+    {
+      "type": "horizontal",
+        "x": -10,
+        "y": 35,
+        "spacing": 10,
+        "direction": "right-to-left",
+        "widgets": [
+          "dvr_storage",
+          "dvr_status"
+        ]
+      }
+    ]
 }

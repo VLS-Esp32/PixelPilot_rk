@@ -47,6 +47,29 @@ extern pthread_cond_t video_cond;
 bool osd_update_ready = false;
 extern std::atomic<bool> video_present;
 
+struct Size {
+    int width = 0;
+    int height = 0;
+};
+
+struct Position {
+    int x = 0;
+    int y = 0;
+};
+
+struct CairoColor {
+    double r;
+    double g;
+    double b;
+    double a;
+};
+
+struct DrawStyle {
+    CairoColor fill;
+    CairoColor outline;
+    double outline_width;
+};
+
 
 double getTimeInterval(struct timespec* timestamp, struct timespec* last_meansure_timestamp) {
   return (timestamp->tv_sec - last_meansure_timestamp->tv_sec) +
@@ -394,278 +417,450 @@ private:
 
 class Widget {
 public:
-	Widget(int pos_x, int pos_y): pos_x(pos_x), pos_y(pos_y) {};
-	Widget(int pos_x, int pos_y, uint num_args): pos_x(pos_x), pos_y(pos_y) {
-		for (auto i=0; i < num_args; i++) {
-			args.push_back(Fact());
-		}
-	};
+    Widget(int pos_x, int pos_y, uint num_args = 0) : position_{pos_x, pos_y}, args_(num_args) {}
+    virtual ~Widget() = default;
 
-	virtual void draw(cairo_t *cr) {};
+	Widget(const Widget&) = delete;
+	Widget& operator=(const Widget&) = delete;
 
-	virtual void setFact(uint idx, Fact fact) {
-		args[idx] = fact;
-	}
+    virtual void draw(cairo_t* cr) = 0;
+    virtual void measure(cairo_t* cr) = 0;
 
-	int x(cairo_t *cr) {
-		cairo_surface_t *target = cairo_get_target(cr);
-		int w = cairo_image_surface_get_width(target);
-		//int h = cairo_image_surface_get_height(target);
-		return (w + pos_x) % w;
-	}
-	int y(cairo_t *cr) {
-		cairo_surface_t *target = cairo_get_target(cr);
-		//int w = cairo_image_surface_get_width(target);
-		int h = cairo_image_surface_get_height(target);
-		return (h + pos_y) % h;
-	}
-	std::pair<int, int> xy(cairo_t *cr) {
-		cairo_surface_t *target = cairo_get_target(cr);
-		int w = cairo_image_surface_get_width(target);
-		int h = cairo_image_surface_get_height(target);
-		return std::pair((w + pos_x) % w, (h + pos_y) % h);
-	}
+    virtual void setFact(uint idx, Fact fact) {
+        storeFact(idx, std::move(fact));
+    }
+
+    void setPosition(int x, int y) {
+        position_ = {x, y};
+    }
+
+    bool measureDirty() const {
+        return measure_dirty_;
+    }
+
+    int width() const {
+        return size_.width;
+    }
+
+    int height() const {
+        return size_.height;
+    }
+
+    const Size& size() const {
+        return size_;
+    }
+
+    const Position& position() const {
+        return position_;
+    }
+
+    int x(cairo_t* cr) const {
+        cairo_surface_t* target = cairo_get_target(cr);
+        int w = cairo_image_surface_get_width(target);
+        return (w + position_.x) % w;
+    }
+
+    int y(cairo_t* cr) const {
+        cairo_surface_t* target = cairo_get_target(cr);
+        int h = cairo_image_surface_get_height(target);
+        return (h + position_.y) % h;
+    }
+
+    std::pair<int, int> xy(cairo_t *cr) const {
+        return {x(cr), y(cr)};
+    }
 
 protected:
-	struct CairoColor {
-        double r;
-        double g;
-        double b;
-        double a;
-    };
-
-	void drawStrokeText(
-        cairo_t *cr,
-        double x, double y,
-        const std::string &text,
-        const CairoColor &fill,
-        const CairoColor &outline,
-        double outline_width
-    ) const {
-        cairo_save(cr);
-
-        cairo_move_to(cr, x, y);
-        cairo_text_path(cr, text.c_str());
-
-		if (outline_width > 0.0) {
-        	cairo_set_line_width(cr, outline_width);
-        	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-        	cairo_set_source_rgba(cr, outline.r, outline.g, outline.b, outline.a);
-        	cairo_stroke_preserve(cr);
-		}
-
-        cairo_set_source_rgba(cr, fill.r, fill.g, fill.b, fill.a);
-        cairo_fill(cr);
-
-        cairo_restore(cr);
+    void measureChild(Widget& child, cairo_t* cr) {
+        if (child.measureDirty()) {
+            child.measure(cr);
+        }
     }
 
-	void drawStrokeIcon(
-		cairo_t *cr,
-        cairo_surface_t *icon,
-        double x, double y,
-        const CairoColor &fill,
-        const CairoColor &outline,
-        int outline_width
-    ) const {
-        if (!icon) return;
-
-        cairo_save(cr);
-
-		if (outline_width > 0) {
-        	cairo_set_source_rgba(cr, outline.r, outline.g, outline.b, outline.a);
-        	for (int dx = -outline_width; dx <= outline_width; ++dx) {
-            	for (int dy = -outline_width; dy <= outline_width; ++dy) {
-                	if (dx * dx + dy * dy > outline_width * outline_width) continue;
-                	cairo_mask_surface(cr, icon, x + dx, y + dy);
-            	}
-        	}
-		}
-
-        cairo_set_source_rgba(cr, fill.r, fill.g, fill.b, fill.a);
-        cairo_mask_surface(cr, icon, x, y);
-
-        cairo_restore(cr);
+    void storeFact(uint idx, Fact fact) {
+        args_.at(idx) = std::move(fact);
+        measure_dirty_ = true;
     }
 
-	int pos_x, pos_y;
-	std::vector<Fact> args;
+    const Fact& fact(uint idx) const {
+        return args_.at(idx);
+    }
+
+    uint factCount() const {
+        return static_cast<uint>(args_.size());
+    }
+
+    void invalidateMeasure() {
+        measure_dirty_ = true;
+    }
+
+    void setSize(int width, int height) {
+        size_ = {width, height};
+        measure_dirty_ = false;
+    }
+
+private:
+    Size size_;
+    Position position_;
+    bool measure_dirty_ = true;
+
+    std::vector<Fact> args_;
 };
-
 
 class TextWidget: public Widget {
 public:
-	TextWidget(int pos_x, int pos_y, std::string text): Widget(pos_x, pos_y), text(text) {};
+    TextWidget(int pos_x, int pos_y, std::string text, uint num_args = 0, DrawStyle style = DEFAULT_STYLE):
+        Widget(pos_x, pos_y, num_args), text_(std::move(text)), style_(style) {}
 
-	virtual void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		drawStrokeText(cr, x, y, text, CairoColor{1,1,1,1}, CairoColor{0,0,0,1}, 2.0);
-	}
+    void setText(std::string text) {
+        if (text_ == text)
+            return;
+        text_ = std::move(text);
+        invalidateMeasure();
+    }
+
+    const std::string& text() const {
+        return text_;
+    }
+
+    void draw(cairo_t* cr) override {
+        auto [x, y] = xy(cr);
+        drawAt(cr, x, y);
+    }
+
+    void drawAt(cairo_t *cr, double x, double y) const {
+        drawText(cr, x, y);
+    }
+
+    void measure(cairo_t* cr) override {
+        cairo_save(cr);
+        buildTextPath(cr, 0.0, 0.0);
+
+        double x1, y1, x2, y2;
+        if (style_.outline_width > 0.0) {
+            setupStroke(cr);
+            cairo_stroke_extents(cr, &x1, &y1, &x2, &y2);
+        } else {
+            cairo_fill_extents(cr, &x1, &y1, &x2, &y2);
+        }
+        setSize(static_cast<int>(std::ceil(x2 - x1)), static_cast<int>(std::ceil(y2 - y1)));
+
+        cairo_new_path(cr);
+        cairo_restore(cr);
+    }
+
+	void setFillColor(const CairoColor& color) {
+        style_.fill = color;
+    }
+
+    void setOutlineColor(const CairoColor& color) {
+        style_.outline = color;
+    }
+
+    void setOutlineWidth(double width) {
+        if (style_.outline_width == width)
+            return;
+        style_.outline_width = width;
+        invalidateMeasure();
+    }
+
+    void setStyle(const DrawStyle& style) {
+        if (style_.outline_width != style.outline_width)
+            invalidateMeasure();
+        style_ = style;
+    }
+
+    const DrawStyle& style() const {
+        return style_;
+    }
+
 protected:
-	std::string text;
+    void drawText(cairo_t* cr, double x, double y) const {
+        cairo_save(cr);
+        buildTextPath(cr, x, y);
+
+        if (style_.outline_width > 0.0) {
+            setupStroke(cr);
+            cairo_set_source_rgba(cr, style_.outline.r, style_.outline.g, style_.outline.b, style_.outline.a);
+            cairo_stroke_preserve(cr);
+        }
+        cairo_set_source_rgba(cr, style_.fill.r, style_.fill.g, style_.fill.b, style_.fill.a);
+        cairo_fill(cr);
+        cairo_restore(cr);
+    }
+
+private:
+    void buildTextPath(cairo_t* cr, double x, double y) const {
+        cairo_new_path(cr);
+        cairo_move_to(cr, x, y);
+        cairo_text_path(cr, text_.c_str());
+    }
+
+    void setupStroke(cairo_t* cr) const {
+        cairo_set_line_width(cr, style_.outline_width);
+        cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    }
+
+	static constexpr DrawStyle DEFAULT_STYLE{
+		.fill = {1.0, 1.0, 1.0, 1.0},
+		.outline = {0.0, 0.0, 0.0, 1.0},
+		.outline_width = 2.0
+	};
+
+    std::string text_;
+	DrawStyle style_;
 };
+
 
 class IconWidget: public Widget {
 public:
-	IconWidget(int pos_x, int pos_y, cairo_surface_t *icon):
-		Widget(pos_x, pos_y), icon(icon) {};
+    IconWidget(int pos_x, int pos_y, cairo_surface_t* icon, uint num_args = 0, DrawStyle style = DEFAULT_STYLE):
+		Widget(pos_x, pos_y, num_args), icon_(icon), style_(style) {}
 
-    virtual ~IconWidget() {
-        cairo_surface_destroy(icon);
+    ~IconWidget() override {
+        if (icon_)
+            cairo_surface_destroy(icon_);
     }
 
-    virtual void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
+    void measure(cairo_t*) override {
+        if (!icon_) {
+            setSize(0, 0);
+            return;
+        }
+        int width = cairo_image_surface_get_width(icon_);
+        int height = cairo_image_surface_get_height(icon_);
+		int outline = outlineWidth();
+
+        setSize(width + outline * 2, height + outline * 2);
+    }
+
+    void draw(cairo_t* cr) override {
+        auto [x, y] = xy(cr);
+        drawIcon(cr, x, y - 20);
+    }
+
+	void drawAt(cairo_t *cr, double x, double y) const {
+		drawIcon(cr, x, y);
 	}
 
-protected:
-	cairo_surface_t *icon;
-};
+	void setFillColor(const CairoColor& color) {
+        style_.fill = color;
+    }
 
+    void setOutlineColor(const CairoColor& color) {
+        style_.outline = color;
+    }
+
+    void setOutlineWidth(double width) {
+        if (style_.outline_width == width)
+            return;
+        style_.outline_width = width;
+        invalidateMeasure();
+    }
+
+    void setStyle(const DrawStyle& style) {
+        if (style_.outline_width != style.outline_width)
+            invalidateMeasure();
+        style_ = style;
+    }
+
+    const DrawStyle& style() const {
+        return style_;
+    }
+
+protected:
+    cairo_surface_t* icon() const {
+        return icon_;
+    }
+
+    void drawIcon(cairo_t* cr, double x, double y) const {
+        if (!icon_)
+            return;
+
+        cairo_save(cr);
+		int outline = outlineWidth();
+
+        if (outline > 0) {
+            cairo_set_source_rgba(cr, style_.outline.r, style_.outline.g, style_.outline.b, style_.outline.a);
+            for (int dx = -outline; dx <= outline; ++dx) {
+                for (int dy = -outline; dy <= outline; ++dy) {
+                    if (dx * dx + dy * dy > outline * outline)
+                        continue;
+                    cairo_mask_surface(cr, icon_, x + dx, y + dy);
+                }
+            }
+        }
+        cairo_set_source_rgba(cr, style_.fill.r, style_.fill.g, style_.fill.b, style_.fill.a);
+        cairo_mask_surface(cr, icon_, x, y);
+        cairo_restore(cr);
+    }
+
+	int outlineWidth() const {
+		return static_cast<int>(std::ceil(style_.outline_width));
+	}
+
+private:
+	static constexpr DrawStyle DEFAULT_STYLE{
+    	.fill = {1.0, 1.0, 1.0, 1.0},
+    	.outline = {0.0, 0.0, 0.0, 1.0},
+    	.outline_width = 1.0
+	};
+
+    cairo_surface_t* icon_;
+	DrawStyle style_;
+};
 
 class IconTextWidget: public Widget {
 public:
-	IconTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string text):
-		Widget(pos_x, pos_y), text(text), icon(icon) {};
+    IconTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string text, uint num_args = 0):
+		Widget(pos_x, pos_y, num_args), icon_(0, 0, icon), text_(0, 0, std::move(text)) {}
 
-    virtual ~IconTextWidget() {
-        cairo_surface_destroy(icon);
+    void measure(cairo_t* cr) override {
+        measureChild(icon_, cr);
+        measureChild(text_, cr);
+        setSize(
+            icon_.width() + SPACING + text_.width(),
+            std::max(icon_.height(), text_.height())
+        );
     }
 
-	virtual void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
-		drawStrokeText(cr, x + 40, y, text, CairoColor{1,1,1,1}, CairoColor{0,0,0,1}, 2.0);
-	}
+    void draw(cairo_t* cr) override {
+        auto [x, y] = xy(cr);
+        icon_.drawAt(cr, x, y - 20);
+        text_.drawAt(cr, x + icon_.width() + SPACING, y);
+    }
 
-protected:
-	std::string text;
-	cairo_surface_t *icon;
+private:
+    static constexpr int SPACING = 14;
+
+    IconWidget icon_;
+    TextWidget text_;
 };
 
 
-class TplTextWidget: public Widget {
+class TplTextWidget: public TextWidget {
 public:
 	TplTextWidget(int pos_x, int pos_y, std::string tpl, uint num_args):
-		Widget(pos_x, pos_y, num_args), tpl(tpl), num_args(num_args) {};
+		TextWidget(pos_x, pos_y, "", num_args), tpl_(std::move(tpl)) {
+        setText(renderTpl());
+    }
 
-	virtual void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		std::unique_ptr<std::string> msg = render_tpl();
-		drawStrokeText(cr, x, y, *msg, CairoColor{1,1,1,1}, CairoColor{0,0,0,1}, 2.0);
+    void measure(cairo_t* cr) override {
+        setText(renderTpl());
+        TextWidget::measure(cr);
+    }
+
+private:
+	std::string renderTpl() const {
+        std::string msg;
+        msg.reserve(tpl_.size());
+
+        uint fact_i = 0;
+		for (std::size_t i = 0; i < tpl_.size(); ++i) {
+            char c = tpl_[i];
+            if (c != '%') {
+                msg.push_back(c);
+                continue;
+            }
+            if (i + 1 >= tpl_.size()) {
+                msg.push_back('%');
+                break;
+            }
+
+            char spec = tpl_[++i];
+            if (spec == '%') {
+                msg.push_back('%');
+                continue;
+            }
+            if (fact_i >= factCount()) {
+                msg.push_back('-');
+                continue;
+            }
+
+            Fact fact = this->fact(fact_i++);
+            if (!fact.isDefined()) {
+                msg.push_back('-');
+                continue;
+            }
+            switch (spec) {
+            case 'b':
+                msg.push_back(fact.getBoolValue() ? 't' : 'f');
+                break;
+            case 'd':
+            case 'i':
+                msg.append(std::to_string(fact.getIntValue()));
+                break;
+            case 'u':
+                msg.append(std::to_string(fact.getUintValue()));
+                break;
+            case 'f': {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%.2f", fact.getDoubleValue());
+                msg.append(buf);
+                break;
+            }
+            case 's':
+                msg.append(fact.getStrValue());
+                break;
+            default:
+                msg.push_back('-');
+                break;
+            }
+        }
+        return msg;
 	}
 
-protected:
-	std::unique_ptr<std::string> render_tpl() {
-		return render_tpl(tpl, args);
-	}
-	std::unique_ptr<std::string> render_tpl(std::string tpl, std::vector<Fact> args) {
-		bool at_placeholder = false;
-		int fact_i = 0;
-		Fact *fact;
-		std::unique_ptr<std::string> msg(new std::string);
-		for(char& c : tpl) {
-			if (c == '%') {
-				at_placeholder = true;
-			} else if (!at_placeholder) {
-				msg->push_back(c);
-			} else if (at_placeholder && c == '%') {
-				msg->push_back('%');
-				at_placeholder = false;
-			} else if (at_placeholder) {
-				at_placeholder = false;
-				if (fact_i >= args.size()) {
-                	msg->push_back('-');
-                	continue;
-            	}
-				fact = &args[fact_i];
-				if (!fact->isDefined()) {
-					msg->push_back('-');
-					fact_i++;
-					continue;
-				}
-				switch (c) {
-				case 'b':
-					{
-						msg->push_back(fact->getBoolValue() ? 't' : 'f');
-						break;
-					}
-				case 'd':
-				case 'i':
-					{
-						msg->append(std::to_string(fact->getIntValue()));
-						break;
-					}
-				case 'u':
-					{
-						msg->append(std::to_string(fact->getUintValue()));
-						break;
-					}
-				case 'f':
-					{
-						char buf[32];
-						std::snprintf(buf, sizeof(buf), "%.2f", fact->getDoubleValue());
-						msg->append(std::string(buf));
-						break;
-					}
-				case 's':
-					{
-						msg->append(fact->getStrValue());
-						break;
-					}
-				default:
-					{
-						msg->push_back('-');
-					}
-				}
-				fact_i++;
-			}
-		}
-		return msg;
-	}
-
-protected:
-	std::string tpl;
-	uint num_args;
+	std::string tpl_;
 };
 
 
 class IconTplTextWidget: public TplTextWidget {
 public:
-	IconTplTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args):
-		TplTextWidget(pos_x, pos_y, tpl, num_args), icon(icon) {};
+    IconTplTextWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args):
+        TplTextWidget(pos_x, pos_y, std::move(tpl), num_args), icon_(0, 0, icon) {}
 
-    virtual ~IconTplTextWidget() {
-        cairo_surface_destroy(icon);
+    void measure(cairo_t* cr) override {
+        measureChild(icon_, cr);
+        TplTextWidget::measure(cr);
+        setSize(
+            icon_.width() + SPACING + TplTextWidget::width(),
+            std::max(icon_.height(), TplTextWidget::height())
+        );
     }
 
-	virtual void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		std::unique_ptr<std::string> msg = render_tpl();
-		drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
-		drawStrokeText(cr, x + 40, y, *msg, CairoColor{1,1,1,1}, CairoColor{0,0,0,1}, 2.0);
-	}
+    void draw(cairo_t* cr) override {
+        auto [x, y] = xy(cr);
+        icon_.drawAt(cr, x, y - 20);
+        drawText(cr, x + icon_.width() + SPACING, y);
+    }
 
-protected:
-	cairo_surface_t *icon;
+private:
+    static constexpr int SPACING = 14;
+    IconWidget icon_;
 };
 
 class BoxWidget: public Widget {
 public:
-	BoxWidget(int pos_x, int pos_y, uint w, uint h, double r, double g, double b, double a):
-		Widget(pos_x, pos_y), w(w), h(h), r(r), g(g), b(b), a(a) {};
+    BoxWidget(int pos_x, int pos_y, uint width, uint height, CairoColor color):
+		Widget(pos_x, pos_y), width_(width), height_(height), color_(color) {
+        setSize(width_, height_);
+    }
 
-	virtual void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		cairo_set_source_rgba(cr, r, g, b, a);
-		cairo_rectangle(cr, x, y, w, h);
-		cairo_fill(cr);
-	}
+    void measure(cairo_t*) override {
+        setSize(width_, height_);
+    }
+
+    void draw(cairo_t* cr) override {
+        auto [x, y] = xy(cr);
+        cairo_set_source_rgba(cr, color_.r, color_.g, color_.b, color_.a);
+        cairo_rectangle(cr, x, y, width_, height_);
+        cairo_fill(cr);
+    }
 
 private:
-	uint w, h;
-	double r, g, b, a;
+    uint width_;
+    uint height_;
+    CairoColor color_;
 };
 
 class BarChartWidget: public Widget {
@@ -678,69 +873,79 @@ public:
 		STATS_AVG
 	};
 
-	BarChartWidget(int pos_x, int pos_y, uint w, uint h, uint window_s, uint num_buckets, BarChartWidget::StatsField stats_field):
-		Widget(pos_x, pos_y, 0), w(w), h(h), window_ms(window_s * 1000), num_buckets(num_buckets), stats_field(stats_field),
-		stats(window_s * 1000, window_s * 1000 / num_buckets) {};
+    BarChartWidget(int pos_x, int pos_y, uint width, uint height, uint window_s, uint num_buckets, StatsField stats_field):
+		Widget(pos_x, pos_y, 1), width_(width), height_(height), window_ms_(window_s * 1000), num_buckets_(num_buckets), 
+		stats_field_(stats_field), stats_(window_s * 1000, window_s * 1000 / num_buckets), max_label_(0, 0, ""), min_label_(0, 0, "") {
+        setSize(width_, height_);
+    }
 
-	virtual void setFact(uint idx, Fact fact) {
-		assert(idx == 0);
-		switch (fact.getType()) {
-		case Fact::T_INT:
-			stats.add(fact.getIntValue());
-			break;
-		case Fact::T_UINT:
-			stats.add(static_cast<long>(fact.getUintValue()));
-		}
-	}
+    void measure(cairo_t *) override {
+        setSize(width_, height_);
+    }
 
-	virtual void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		// box
-		cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.4);
-		cairo_rectangle(cr, x, y, w, h);
-		cairo_fill(cr);
+    void draw(cairo_t *cr) override {
+        auto [x, y] = xy(cr);
+        // box
+        cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.4);
+        cairo_rectangle(cr, x, y, width_, height_);
+        cairo_fill(cr);
 
-		std::vector<Stats> all_stats = stats.get_bucket_stats();
-		if (all_stats.size() < 3) {
-			SPDLOG_DEBUG("Can't draw bar chart - too few values");
-			return;
-		}
-		all_stats.pop_back(); // drop last bucket, because it is usually still not full
-		std::vector<double> stats = select_stats(all_stats);
-		double min = *std::min_element(stats.begin(), stats.end());
-		double max = *std::max_element(stats.begin(), stats.end());
+        std::vector<Stats> all_stats = stats_.get_bucket_stats();
+        if (all_stats.size() < 3) {
+            SPDLOG_DEBUG("Can't draw bar chart - too few values");
+            return;
+        }
+        all_stats.pop_back(); // drop last bucket, because it is usually still not full
+        std::vector<double> stats = select_stats(all_stats);
+        double min = *std::min_element(stats.begin(), stats.end());
+        double max = *std::max_element(stats.begin(), stats.end());
 
-		// legend
-		drawStrokeText(cr, x + 2, y + 15, shorten(max), CairoColor{1,1,1,1}, CairoColor{0,0,0,1}, 2.0);
-		drawStrokeText(cr, x + 2, y + h, shorten(min), CairoColor{1,1,1,1}, CairoColor{0,0,0,1}, 2.0);
+        // legend
+        max_label_.setText(shorten(max));
+        min_label_.setText(shorten(min));
+        max_label_.drawAt(cr, x + 2, y + 15);
+        min_label_.drawAt(cr, x + 2, y + height_);
 
-		// bars
-		cairo_set_source_rgba(cr, 200.0, 200.0, 200.0, 0.8);
+        // bars
+        cairo_set_source_rgba(cr, 200.0, 200.0, 200.0, 0.8);
 
-		double scale = max - min;
-		SPDLOG_TRACE("Scale: {}, min {}, max {}", scale, min, max);
-		uint legend_w = 65;
-		uint chart_w = w - legend_w;
+        double scale = max - min;
+        SPDLOG_TRACE("Scale: {}, min {}, max {}", scale, min, max);
+        uint legend_w = 65;
+        uint chart_w = width_ - legend_w;
 
-		uint bar_pad = 4;
-		uint bar_w = (chart_w - (bar_pad * num_buckets)) / num_buckets;
-		uint bar_x = x + legend_w;
+        uint bar_pad = 4;
+        uint bar_w = (chart_w - (bar_pad * num_buckets_)) / num_buckets_;
+        uint bar_x = x + legend_w;
 		SPDLOG_TRACE(
-					 "chart_w {} bar_w {}, bar_x {}",
-					 chart_w, bar_w, bar_x
-                    );
-		for (auto val : stats) {
-			double normalized = val - min;
-			double bar_h = -1.0 * (normalized * (h - 10)) / scale;
+			 "chart_w {} bar_w {}, bar_x {}",
+			 chart_w, bar_w, bar_x
+            );
+
+        for (auto val : stats) {
+            double normalized = val - min;
+            double bar_h = -1.0 * (normalized * (height_ - 10)) / scale;
 			// h -> max-min
 			// ? -> normalized
 			SPDLOG_TRACE("val {}, cairo_rectangle(cr, {}, {}, {}, {})",
-						 val, bar_x, y + h, bar_w, bar_h);
-			cairo_rectangle(cr, bar_x, y + h, bar_w, bar_h - 2);
-			cairo_fill(cr);
-			bar_x += (bar_pad + bar_w);
-		}
-	}
+						 val, bar_x, y + height_, bar_w, bar_h);
+            cairo_rectangle(cr, bar_x, y + height_, bar_w, bar_h - 2);
+            cairo_fill(cr);
+            bar_x += bar_pad + bar_w;
+        }
+    }
+
+    void setFact(uint idx, Fact fact) override {
+        assert(idx == 0);
+        switch (fact.getType()) {
+        case Fact::T_INT:
+            stats_.add(fact.getIntValue());
+            break;
+        case Fact::T_UINT:
+            stats_.add(static_cast<long>(fact.getUintValue()));
+            break;
+        }
+    }
 
 private:
 	/**
@@ -774,7 +979,7 @@ private:
 		std::vector<double> res;
 		res.reserve(stats.size());
 		for (auto stat : stats) {
-			switch(stats_field) {
+			switch(stats_field_) {
 			case STATS_MIN:
 				res.push_back(static_cast<double>(stat.min));
 				break;
@@ -794,10 +999,17 @@ private:
 		}
 		return res;
 	}
-	uint w, h;
-	uint window_ms, num_buckets;
-	StatsField stats_field = STATS_SUM;
-	RunningAverage stats;
+
+    uint width_;
+    uint height_;
+    uint window_ms_;
+    uint num_buckets_;
+
+    StatsField stats_field_ = STATS_SUM;
+    RunningAverage stats_;
+
+    TextWidget max_label_;
+    TextWidget min_label_;
 };
 
 /**
@@ -809,114 +1021,222 @@ private:
 class PopupWidget: public Widget {
 public:
 	PopupWidget(int pos_x, int pos_y, uint timeout_ms, uint num_args) :
-		Widget(pos_x, pos_y, num_args), timeout(timeout_ms) {};
+		Widget(pos_x, pos_y, num_args), timeout_(timeout_ms) {}
 
-	virtual void setFact(uint _idx, Fact fact) {
-		auto now = std::chrono::steady_clock::now();
-		std::string msg = fact.getStrValue();
-		msgs.push_back(std::pair(now, msg));
-	}
+	void measure(cairo_t *cr) override {
+        auto now = std::chrono::steady_clock::now();
+        removeExpired(now);
 
-	void draw(cairo_t *cr) {
+        double max_width = 0.0;
+        double total_height = 0.0;
+
+        for (auto &msg : msgs_) {
+            if (!msg.measured) {
+                cairo_text_extents_t extents;
+                cairo_text_extents(cr, msg.text.c_str(), &extents);
+                msg.width = extents.width;
+                msg.height = extents.height;
+                msg.measured = true;
+            }
+            max_width = std::max(max_width, msg.width + PADDING * 2);
+            total_height += msg.height + PADDING * 2 + ITEM_SPACING;
+        }
+        setSize(
+            static_cast<int>(std::ceil(max_width)),
+            static_cast<int>(std::ceil(total_height))
+        );
+    }
+
+	void draw(cairo_t *cr) override {
 		auto [x, y] = xy(cr);
 		auto now = std::chrono::steady_clock::now();
-
-		// Remove outdated messages
-		while (!msgs.empty() && (now - msgs.front().first > timeout)) {
-			msgs.pop_front();
+		if (removeExpired(now)) {
+			invalidateMeasure();
 		}
-		uint y_offset = y;
-		for (auto [time, msg] : msgs) {
-			auto past = std::chrono::duration_cast<std::chrono::milliseconds>(now - time);
-			double fade_fraction = 1.0 - static_cast<double>(past.count()) / static_cast<double>(timeout.count());
+        double y_offset = y;
+        for (const auto &msg : msgs_) {
+            auto past = std::chrono::duration_cast<std::chrono::milliseconds>(now - msg.time);
+            double fade_fraction = 1.0 - static_cast<double>(past.count()) / static_cast<double>(timeout_.count());
 
-			cairo_text_extents_t extents;
-			cairo_text_extents(cr, msg.c_str(), &extents);
-
-			// Draw popup box
-			double padding = 5.0;
-			cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, fade_fraction / 3.0);
+            // Draw popup box
+            cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, fade_fraction / 3.0);
 			cairo_rectangle(cr,
-							x - padding,
-							y_offset + padding,
-							extents.width + (padding * 2), -(extents.height + (padding * 2)));
+							x - PADDING,
+							y_offset + PADDING,
+							msg.width + (PADDING * 2), -(msg.height + (PADDING * 2)));
 			cairo_fill(cr);
 
 			// Draw popup text
 			cairo_set_source_rgba(cr, 255.0, 255.0, 255.0, fade_fraction);
 			cairo_move_to(cr, x, y_offset);
-			cairo_show_text(cr, msg.c_str());
-			y_offset += extents.height + (padding * 2) + 2;
+			cairo_show_text(cr, msg.text.c_str());
+			y_offset += msg.height + (PADDING * 2) + ITEM_SPACING;
 		}
 	}
 
+    void setFact(uint, Fact fact) override {
+        msgs_.push_back({
+            .time = std::chrono::steady_clock::now(),
+            .text = fact.getStrValue()
+        });
+        invalidateMeasure();
+    }
+
 private:
-	std::deque<std::pair<
-				   std::chrono::time_point<std::chrono::steady_clock>,
-				   std::string
-				   >> msgs;
-	std::chrono::milliseconds timeout;
+    struct Message {
+        std::chrono::time_point<std::chrono::steady_clock> time;
+        std::string text;
+        double width = 0.0;
+        double height = 0.0;
+        bool measured = false;
+    };
+
+    bool removeExpired(std::chrono::time_point<std::chrono::steady_clock> now) {
+		bool removed = false;
+        while (!msgs_.empty() && now - msgs_.front().time > timeout_) {
+            msgs_.pop_front();
+			removed = true;
+        }
+		return removed;
+    }
+
+    static constexpr double PADDING = 5.0;
+    static constexpr double ITEM_SPACING = 2.0;
+
+    std::deque<Message> msgs_;
+    std::chrono::milliseconds timeout_;
 };
 
 //
 // Specific widgets
 //
 
-class DvrStatusWidget: public IconTextWidget {
+class DvrStatusWidget: public Widget {
 public:
-	DvrStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string text) :
-		IconTextWidget(pos_x, pos_y, icon, text) {
-		args.push_back(Fact());
-	};
+    DvrStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string text):
+		Widget(pos_x, pos_y, 1), icon_(0, 0, icon), text_(0, 0, std::move(text), 0, DrawStyle{
+			.fill = {1.0, 0.0, 0.0, 1.0},
+			.outline = {0.0, 0.0, 0.0, 1.0},
+			.outline_width = 2.0
+		}) {}
 
-	void draw(cairo_t *cr) {
-		if(args[0].isDefined() && args[0].getBoolValue()) {
-			auto [x, y] = xy(cr);
-			drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
-			drawStrokeText(cr, x + 40, y, text, CairoColor{1.0, 0.0, 0.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 2.0);
-		}
-	}
-};
-
-class DvrStorageWidget : public IconWidget {
-public:
-    DvrStorageWidget(int pos_x, int pos_y, cairo_surface_t *icon) :
-        IconWidget(pos_x, pos_y, icon) {
-        args.resize(2);
+    void measure(cairo_t *cr) override {
+        if (!isActive()) {
+            setSize(0, 0);
+            return;
+        }
+        measureChild(icon_, cr);
+        measureChild(text_, cr);
+        setSize(
+            icon_.width() + SPACING + text_.width(),
+            std::max(icon_.height(), text_.height())
+        );
     }
 
-    void draw(cairo_t *cr) override {
-        if (!args[0].isDefined()) {
+	void draw(cairo_t *cr) override {
+        if (!isActive()) {
             return;
-        }
+		}
         auto [x, y] = xy(cr);
-        const auto status = args[0].getUintValue();
-
-        CairoColor icon_color{1.0, 1.0, 1.0, 1.0};
-        std::string text = "-";
-
-        switch (status) {
-        case 0:
-            break;
-        case 1:
-            if (args[1].isDefined()) {
-                text = format_storage_size(args[1].getUintValue());
-            }
-            break;
-        case 2:
-			icon_color = CairoColor{1.0, 0.0, 0.0, 1.0};
-            if (args[1].isDefined()) {
-                text = format_storage_size(args[1].getUintValue());
-            }
-            break;
-        default:
-            return;
-        }
-        drawStrokeIcon(cr, icon, x, y - 20, icon_color, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
-        drawStrokeText(cr, x + 40, y, text, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 2.0);
+        icon_.drawAt(cr, x, y - 20);
+        text_.drawAt(cr, x + icon_.width() + SPACING, y);
     }
 
 private:
+    bool isActive() const {
+        Fact status = fact(0);
+        return status.isDefined() && status.getBoolValue();
+    }
+
+	static constexpr int SPACING = 14;
+
+    IconWidget icon_;
+    TextWidget text_;
+};
+
+class DvrStorageWidget : public Widget {
+public:
+    DvrStorageWidget(int pos_x, int pos_y, cairo_surface_t *icon):
+		Widget(pos_x, pos_y, 2), icon_(0, 0, icon), text_(0, 0, "-") {}
+
+    void measure(cairo_t *cr) override {
+        if (!visible_) {
+            setSize(0, 0);
+            return;
+        }
+        measureChild(icon_, cr);
+        if (!show_text_) {
+            setSize(icon_.width(), icon_.height());
+            return;
+        }
+        measureChild(text_, cr);
+        setSize(
+            icon_.width() + SPACING + text_.width(),
+            std::max(icon_.height(), text_.height())
+        );
+    }
+
+    void draw(cairo_t *cr) override {
+        if (!visible_) {
+            return;
+        }
+        auto [x, y] = xy(cr);
+        icon_.drawAt(cr, x, y - 20);
+		if (show_text_) {
+        	text_.drawAt(cr, x + icon_.width() + SPACING, y);
+    	}
+    }
+
+    void setFact(uint idx, Fact fact) override {
+        storeFact(idx, std::move(fact));
+        updateState();
+    }
+
+private:
+    void updateState() {
+        Fact status_fact = fact(0);
+        if (!status_fact.isDefined()) {
+            visible_ = false;
+            return;
+        }
+
+        const auto status = status_fact.getUintValue();
+        switch (status) {
+        case 0:
+            visible_ = true;
+			show_text_ = false;
+        	icon_.setFillColor({0.4, 0.4, 0.44, 1.0});
+        	icon_.setOutlineColor({0.0, 0.0, 0.0, 0.4});
+            break;
+        case 1:
+            visible_ = true;
+			show_text_ = true;
+			icon_.setFillColor({1.0, 1.0, 1.0, 1.0});
+        	icon_.setOutlineColor({0.0, 0.0, 0.0, 1.0});
+            updateStorageText();
+            break;
+        case 2:
+            visible_ = true;
+			show_text_ = true;
+			icon_.setFillColor({1.0, 0.0, 0.0, 1.0});
+        	icon_.setOutlineColor({0.0, 0.0, 0.0, 1.0});
+            updateStorageText();
+            break;
+        default:
+            visible_ = false;
+            break;
+        }
+    }
+
+    void updateStorageText() {
+        Fact storage_fact = fact(1);
+        if (!storage_fact.isDefined()) {
+            text_.setText("-");
+            return;
+        }
+        text_.setText(format_storage_size(storage_fact.getUintValue()));
+    }
+
     static std::string format_storage_size(uint64_t bytes) {
         struct StorageUnit {
             uint64_t size;
@@ -924,10 +1244,10 @@ private:
         };
 
         static constexpr StorageUnit units[] = {
-            {1ULL << 40, "TiB"},
-            {1ULL << 30, "GiB"},
-            {1ULL << 20, "MiB"},
-            {1ULL << 10, "KiB"},
+            {1ULL << 40, "T"},
+            {1ULL << 30, "G"},
+            {1ULL << 20, "M"},
+            {1ULL << 10, "K"},
         };
 
         const StorageUnit *unit = &units[3];
@@ -944,54 +1264,110 @@ private:
 
         return buf;
     }
+
+    static constexpr int SPACING = 5;
+    bool visible_ = false;
+	bool show_text_ = false;
+
+    IconWidget icon_;
+    TextWidget text_;
 };
 
 class IconStatusWidget: public IconWidget {
 public:
-	IconStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon) :
-		IconWidget(pos_x, pos_y, icon) {
-		args.push_back(Fact());
-	};
+    IconStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon) :
+		IconWidget(pos_x, pos_y, icon, 1, DrawStyle{
+			.fill = {0.4, 0.4, 0.44, 1.0},
+			.outline = {0.0, 0.0, 0.0, 0.4},
+			.outline_width = 1.0}) {}
 
-	void draw(cairo_t *cr) {
-		if(args[0].isDefined() && args[0].getBoolValue()) {
-			auto [x, y] = xy(cr);
-			drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
-		} else {
-			auto [x, y] = xy(cr);
-			drawStrokeIcon(cr, icon, x, y - 20, CairoColor{0.4, 0.4, 0.44, 1.0}, CairoColor{0.0, 0.0, 0.0, 0.4}, 1);
-		}
-	}
-};
-
-class IconTplStatusWidget : public IconTplTextWidget {
-public:
-    IconTplStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args) :
-        IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args) {}
-
-    void draw(cairo_t *cr) {
-        auto [x, y] = xy(cr);
-
-        std::vector<Fact> subargs;
-        for (size_t i = 1; i < args.size(); ++i) subargs.push_back(args[i]);
-        std::unique_ptr<std::string> msg = render_tpl(tpl, subargs);
-
-        if(args[0].isDefined() && args[0].getBoolValue()) {
-            drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
-            drawStrokeText(cr, x + 35, y, *msg, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 2.0);
+    void setFact(uint idx, Fact fact) override {
+        if (fact.isDefined() && fact.getBoolValue()) {
+            setFillColor({1.0, 1.0, 1.0, 1.0});
+            setOutlineColor({0.0, 0.0, 0.0, 1.0});
         } else {
-            drawStrokeIcon(cr, icon, x, y - 20, CairoColor{0.4, 0.4, 0.44, 1.0}, CairoColor{0.0, 0.0, 0.0, 0.4}, 1);
-            drawStrokeText(cr, x + 35, y, *msg, CairoColor{0.4, 0.4, 0.44, 1.0}, CairoColor{0.0, 0.0, 0.0, 0.4}, 2.0);
+            setFillColor({0.4, 0.4, 0.44, 1.0});
+            setOutlineColor({0.0, 0.0, 0.0, 0.4});
         }
     }
 };
 
-class VideoWidget: public IconTplTextWidget {
+class IconTplStatusWidget : public Widget {
+public:
+    IconTplStatusWidget(int pos_x, int pos_y, cairo_surface_t *icon, std::string tpl, uint num_args) :
+		Widget(pos_x, pos_y, num_args), icon_(0, 0, icon), text_(0, 0, std::move(tpl), num_args - 1) {
+        setInactiveStyle();
+    }
+
+    void measure(cairo_t *cr) override {
+        measureChild(icon_, cr);
+        measureChild(text_, cr);
+        setSize(
+            icon_.width() + SPACING + text_.width(),
+            std::max(icon_.height(), text_.height())
+        );
+    }
+
+    void draw(cairo_t *cr) override {
+        auto [x, y] = xy(cr);
+        icon_.drawAt(cr, x, y - 20);
+        text_.drawAt(cr, x + icon_.width() + SPACING, y);
+    }
+
+    void setFact(uint idx, Fact fact) override {
+        if (idx == 0) {
+            if (fact.isDefined() && fact.getBoolValue()) {
+                setActiveStyle();
+            } else {
+                setInactiveStyle();
+            }
+            return;
+        }
+        text_.setFact(idx - 1, std::move(fact));
+        invalidateMeasure();
+    }
+
+private:
+    void setActiveStyle() {
+        const CairoColor fill{
+            1.0, 1.0, 1.0, 1.0
+        };
+        const CairoColor outline{
+            0.0, 0.0, 0.0, 1.0
+        };
+
+        icon_.setFillColor(fill);
+        icon_.setOutlineColor(outline);
+        text_.setFillColor(fill);
+        text_.setOutlineColor(outline);
+    }
+
+    void setInactiveStyle() {
+        const CairoColor fill{
+            0.4, 0.4, 0.44, 1.0
+        };
+        const CairoColor outline{
+            0.0, 0.0, 0.0, 0.4
+        };
+
+        icon_.setFillColor(fill);
+        icon_.setOutlineColor(outline);
+        text_.setFillColor(fill);
+        text_.setOutlineColor(outline);
+    }
+
+    static constexpr int SPACING = 9;
+
+    IconWidget icon_;
+    TplTextWidget text_;
+};
+
+class VideoWidget: public Widget {
 public:
   VideoWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
               cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
-		IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
-        fps_(window_size_ms, bucket_size_ms)
+		Widget(pos_x, pos_y, num_args), icon_(0, 0, icon), text_(0, 0, std::move(tpl), num_args),
+        fps_(window_size_ms, bucket_size_ms) 
     {
         if (refresh_rate < refresh_frequency_ms || refresh_rate > MAX_WIDGET_REFRESH_MS) {
             spdlog::warn("VideoWidget: Refresh rate '{}' is out of range [{} {}].",
@@ -1004,42 +1380,63 @@ public:
         }
     }
 
-	virtual void setFact(uint idx, Fact fact) {
-		if (idx == 0) {
+    void measure(cairo_t* cr) override {
+        measureChild(icon_, cr);
+        measureChild(text_, cr);
+        setSize(
+            icon_.width() + SPACING + text_.width(),
+            std::max(icon_.height(), text_.height())
+        );
+    }
 
-            if (!fact.isDefined()) {
-                args[idx] = Fact();
-                return;
-            }
-			// replace the value with its increment rate per-second
-			ulong num_frames = fact.getUintValue(); // should be always '1'
-            fps_.add(num_frames);
+    void draw(cairo_t* cr) override {
+        auto [x, y] = xy(cr);
+        icon_.drawAt(cr, x, y - 20);
+        text_.drawAt(cr, x + icon_.width() + SPACING, y);
+    }
 
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = now - last_drawn_;
-            
-            if (elapsed < refresh_rate_ms_) {
-                return;
-            }
-            last_drawn_ = now;
+    void setFact(uint idx, Fact fact) override {
+        if (idx != 0) {
+            text_.setFact(idx, std::move(fact));
+            invalidateMeasure();
+            return;
+        }
+        if (!fact.isDefined()) {
+            text_.setFact(idx, Fact());
+            invalidateMeasure();
+            return;
+        }
+		// replace the value with its increment rate per-second
+        ulong num_frames = fact.getUintValue(); // should be always '1'
+        fps_.add(num_frames);
 
-            args[idx] = Fact(FactMeta("video_fps"), (ulong)fps_.rate_per_second_over_last_ms(1000));
-		} else {
-			args[idx] = fact;
-		}
-	}
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = now - last_drawn_;
+
+        if (elapsed < refresh_rate_ms_) {
+            return;
+        }
+        last_drawn_ = now;
+        text_.setFact(idx, Fact(FactMeta("video_fps"), (ulong)fps_.rate_per_second_over_last_ms(1000)));
+        invalidateMeasure();
+    }
 
 private:
+    static constexpr int SPACING = 14;
+
+    IconWidget icon_;
+    TplTextWidget text_;
+
     RunningAverage fps_;
     std::chrono::milliseconds refresh_rate_ms_{};
     std::chrono::steady_clock::time_point last_drawn_{};
 };
 
-class VideoBitrateWidget: public IconTplTextWidget {
+class VideoBitrateWidget: public Widget {
 public:
   VideoBitrateWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
                      cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
-        IconTplTextWidget(pos_x, pos_y, icon, tpl, num_args),
+        Widget(pos_x, pos_y, num_args), icon_(0, 0, icon), text_(0, 0, std::move(tpl), num_args),
         bps_(window_size_ms, bucket_size_ms)
     {
         assert(num_args == 1);
@@ -1054,11 +1451,26 @@ public:
         }
     }
 
-	virtual void setFact(uint idx, Fact fact) {
-		assert(idx == 0);
+    void measure(cairo_t* cr) override {
+        measureChild(icon_, cr);
+        measureChild(text_, cr);
+        setSize(
+            icon_.width() + SPACING + text_.width(),
+            std::max(icon_.height(), text_.height())
+        );
+    }
 
+    void draw(cairo_t* cr) override {
+        auto [x, y] = xy(cr);
+        icon_.drawAt(cr, x, y - 20);
+        text_.drawAt(cr, x + icon_.width() + SPACING, y);
+    }
+
+    void setFact(uint idx, Fact fact) override {
+        assert(idx == 0);
         if (!fact.isDefined()) {
-            args[idx] = Fact();
+            text_.setFact(idx, Fact());
+            invalidateMeasure();
             return;
         }
 		// replace the value with its increment rate per-second
@@ -1074,20 +1486,26 @@ public:
         last_drawn_ = now;
 
         // 125000 is 1_000_000 / 8 (megabits, not megabytes)
-        args[idx] = Fact(FactMeta("video_mbps"), bps_.rate_per_second_over_last_ms(1000) / 125000.0);
+        text_.setFact(idx, Fact(FactMeta("video_mbps"), bps_.rate_per_second_over_last_ms(1000) / 125000.0));
+        invalidateMeasure();
     }
 
 private:
+    static constexpr int SPACING = 14;
+
+    IconWidget icon_;
+    TplTextWidget text_;
+
     RunningAverage bps_;
     std::chrono::milliseconds refresh_rate_ms_{};
     std::chrono::steady_clock::time_point last_drawn_{};
 };
 
-class VideoDecodeLatencyWidget: public IconTplTextWidget {
+class VideoDecodeLatencyWidget: public Widget {
 public:
   VideoDecodeLatencyWidget(int pos_x, int pos_y, uint window_size_ms, uint bucket_size_ms,
                            cairo_surface_t *icon, std::string tpl, uint refresh_rate, uint num_args) :
-        IconTplTextWidget(pos_x, pos_y, icon, tpl, 3),  // 3 args, because we calculate min/max/avg
+        Widget(pos_x, pos_y, num_args), icon_(0, 0, icon), text_(0, 0, std::move(tpl), 3),
         timing_(window_size_ms, bucket_size_ms)
     {
         assert(num_args == 1);
@@ -1102,16 +1520,31 @@ public:
         }
     }
 
-	virtual void setFact(uint idx, Fact fact) {
-		assert(idx == 0);
+    void measure(cairo_t *cr) override {
+        measureChild(icon_, cr);
+        measureChild(text_, cr);
+        setSize(
+            icon_.width() + SPACING + text_.width(),
+            std::max(icon_.height(), text_.height())
+        );
+    }
 
-		if (!fact.isDefined()) {
-        	args[0] = Fact();
-        	args[1] = Fact();
-        	args[2] = Fact();
-        	return;
-    	}
-		ulong decode_time = fact.getUintValue();
+    void draw(cairo_t *cr) override {
+        auto [x, y] = xy(cr);
+        icon_.drawAt(cr, x, y - 20);
+        text_.drawAt(cr, x + icon_.width() + SPACING, y);
+    }
+
+    void setFact(uint idx, Fact fact) override {
+        assert(idx == 0);
+        if (!fact.isDefined()) {
+            text_.setFact(0, Fact());
+            text_.setFact(1, Fact());
+            text_.setFact(2, Fact());
+            invalidateMeasure();
+            return;
+        }
+        const ulong decode_time = fact.getUintValue();
         timing_.add(decode_time);
 
         auto now = std::chrono::steady_clock::now();
@@ -1123,31 +1556,61 @@ public:
         last_drawn_ = now;
 
         Stats stats = timing_.get_stats_over_last_ms_result(1000);
-		args[0] = Fact(FactMeta("video_avg"), stats.average);
-		args[1] = Fact(FactMeta("video_min"), stats.min);
-		args[2] = Fact(FactMeta("video_max"), stats.max);
-	}
+        text_.setFact(0, Fact(FactMeta("video_avg"), stats.average));
+        text_.setFact(1, Fact(FactMeta("video_min"), stats.min));
+        text_.setFact(2, Fact(FactMeta("video_max"), stats.max));
+        invalidateMeasure();
+    }
 
 private:
+    static constexpr int SPACING = 14;
+
+    IconWidget icon_;
+    TplTextWidget text_;
+
     RunningAverage timing_;
     std::chrono::milliseconds refresh_rate_ms_{};
     std::chrono::steady_clock::time_point last_drawn_{};
 };
 
-
-class GPSWidget: public Widget {
+class GPSWidget: public TextWidget {
 public:
 	GPSWidget(int pos_x, int pos_y, uint num_args) :
-		Widget(pos_x, pos_y, num_args) {
+		TextWidget(pos_x, pos_y, "", num_args) {
 		assert(num_args == 3);
-	};
+	}
 
-	void draw(cairo_t *cr) {
-		if( !(args[0].isDefined() && args[1].isDefined() && args[2].isDefined()) ) return;
-		auto [x, y] = xy(cr);
-		std::string fix_type = "undef";
+    void measure(cairo_t *cr) override {
+        if (!isReady()) {
+            setSize(0, 0);
+            return;
+        }
+        setText(formatText());
+        TextWidget::measure(cr);
+    }
+
+    void draw(cairo_t *cr) override {
+        if (!isReady())
+            return;
+        auto [x, y] = xy(cr);
+        drawAt(cr, x + TEXT_OFFSET_X, y);
+    }
+
+private:
+    bool isReady() const {
+        Fact fix = fact(0);
+        Fact lat = fact(1);
+        Fact lon = fact(2);
+        return fix.isDefined() && lat.isDefined() && lon.isDefined();
+    }
+
+    std::string formatText() const {
+        Fact fix_fact = fact(0);
+        Fact lat_fact = fact(1);
+        Fact lon_fact = fact(2);
+        std::string fix_type = "undef";
 		char buf[64];
-		switch (args[0].getUintValue()) {
+		switch (fix_fact.getUintValue()) {
 		case 0:
 			fix_type = "no GPS";
 			break;
@@ -1176,46 +1639,81 @@ public:
 			fix_type = "PPP 3D";
 			break;
 		}
-		double lat = args[1].getIntValue() * 1.0e-7;
-		double lon = args[2].getIntValue() * 1.0e-7;
-		snprintf(buf, sizeof(buf), "%s Lat:%f, Lon:%f", fix_type.c_str(), lat, lon);
-		drawStrokeText(cr, x + 40, y, std::string(buf), CairoColor{1,1,1,1}, CairoColor{0,0,0,1}, 2.0);
-	}
-};
+        const double lat = lat_fact.getIntValue() * 1.0e-7;
+        const double lon = lon_fact.getIntValue() * 1.0e-7;
+        std::snprintf(buf, sizeof(buf), "%s Lat:%f, Lon:%f", fix_type.c_str(), lat, lon);
+        return buf;
+    }
 
+    static constexpr int TEXT_OFFSET_X = 40;
+};
 
 class DebugWidget: public Widget {
 public:
-	DebugWidget(int pos_x, int pos_y, uint num_args) :
-		Widget(pos_x, pos_y, num_args) {};
+    DebugWidget(int pos_x, int pos_y, uint num_args) :
+		Widget(pos_x, pos_y, num_args), lines_(num_args, "undef") {}
 
-	void draw(cairo_t *cr) {
-		auto [x, y] = xy(cr);
-		auto y_offset = y;
-		for (Fact &fact : args) {
-			std::ostringstream oss;
-			if (!fact.isDefined()) {
-				oss << "undef";
-			} else {
-				oss << fact.getName() << " (" << fact.getTypeName() << ") {";
-				for (const auto &tag : fact.getTags()) {
-					oss << tag.first << "=>" << tag.second << ", ";
-				}
-				oss << "} = " << fact.asString();
-			}
-			std::string text =  oss.str();
-			cairo_set_source_rgba(cr, 255.0, 50.0, 50.0, 1);
-			cairo_move_to(cr, x, y_offset);
-			cairo_show_text(cr, text.c_str());
-			y_offset += 20;
-			SPDLOG_INFO("dbg draw {}", text);
-		}
-	}
+    void measure(cairo_t *cr) override {
+        double max_width = 0.0;
+        for (const auto &line : lines_) {
+            cairo_text_extents_t extents;
+            cairo_text_extents(cr, line.c_str(), &extents);
+            max_width = std::max(max_width, extents.width);
+        }
+        setSize(
+            static_cast<int>(std::ceil(max_width)),
+            static_cast<int>(lines_.size() * LINE_HEIGHT)
+        );
+    }
+
+    void draw(cairo_t *cr) override {
+        auto [x, y] = xy(cr);
+        auto y_offset = y;
+        for (const auto &line : lines_) {
+            cairo_set_source_rgba(cr, 255.0, 50.0, 50.0, 1.0);
+            cairo_move_to(cr, x, y_offset);
+            cairo_show_text(cr, line.c_str());
+            y_offset += LINE_HEIGHT;
+            SPDLOG_INFO("dbg draw {}", line);
+        }
+    }
+
+    void setFact(uint idx, Fact fact) override {
+        lines_.at(idx) = formatFact(std::move(fact));
+        invalidateMeasure();
+    }
+
+private:
+    static std::string formatFact(Fact fact) {
+        std::ostringstream oss;
+
+        if (!fact.isDefined()) {
+            oss << "undef";
+        } else {
+            oss << fact.getName() << " (" << fact.getTypeName() << ") {";
+            for (const auto &tag : fact.getTags()) {
+                oss << tag.first << "=>" << tag.second << ", ";
+            }
+            oss << "} = " << fact.asString();
+        }
+        return oss.str();
+    }
+
+    static constexpr int LINE_HEIGHT = 20;
+
+    std::vector<std::string> lines_;
 };
 
 class ExternalSurfaceWidget: public Widget {
 public:
 	ExternalSurfaceWidget(int pos_x, int pos_y, std::string shm_name ): Widget(pos_x, pos_y), shm_name(shm_name)  {};
+
+	void measure(cairo_t *cr) override {
+        cairo_surface_t *target = cairo_get_target(cr);
+        const int width = cairo_image_surface_get_width(target);
+        const int height = cairo_image_surface_get_height(target);
+        setSize(width, height);
+    }
 
 	void init_shm(cairo_t *cr) {
 		SPDLOG_INFO("Creating shm region {}", shm_name);
@@ -1288,7 +1786,7 @@ public:
 		shm_data = reinterpret_cast<unsigned char*>(shm_region);
 	}
 
-	virtual void draw(cairo_t *cr) {
+	void draw(cairo_t *cr) override {
         if (!shm_region) {
             init_shm(cr);
         }
@@ -1309,7 +1807,7 @@ public:
 		} 
     }
 
-    virtual ~ExternalSurfaceWidget() {
+    ~ExternalSurfaceWidget() override {
 		SPDLOG_INFO("Destroying shm region {}", shm_name);
 
         for (int i = 0; i < SHM_BUFFERS_COUNT; ++i) {
@@ -1336,38 +1834,62 @@ protected:
 class IconSelectorWidget : public Widget {
 public:
     IconSelectorWidget(int pos_x, int pos_y, const std::vector<std::pair<std::pair<int, int>, std::filesystem::path>>& ranges_and_icons, const std::filesystem::path& assets_dir)
-        : Widget(pos_x, pos_y), assets_dir(assets_dir) {
-        args.push_back(Fact()); // Expect one fact as input
-
+        : Widget(pos_x, pos_y, 1), assets_dir_(assets_dir) {
         // Load and cache all icons during initialization
         for (const auto& [range, icon_path] : ranges_and_icons) {
             cairo_surface_t* icon = openIcon(icon_path);
             if (icon) {
-                icon_cache[range] = icon;
+                icon_cache_[range] = icon;
             }
         }
     }
 
-    virtual ~IconSelectorWidget() {
+    ~IconSelectorWidget() override {
         // Clean up cached icons
-        for (auto& [range, icon] : icon_cache) {
+        for (auto& [range, icon] : icon_cache_) {
             if (icon) {
                 cairo_surface_destroy(icon);
             }
         }
     }
 
-    virtual void setFact(uint idx, Fact fact) override {
-        assert(idx == 0);
-        args[idx] = fact;
-        current_icon = selectIcon(fact);
+	void measure(cairo_t *) override {
+        if (!current_icon_) {
+            setSize(0, 0);
+            return;
+        }
+        int width = cairo_image_surface_get_width(current_icon_);
+        int height = cairo_image_surface_get_height(current_icon_);
+        setSize(width + 2, height + 2);
     }
 
-    virtual void draw(cairo_t *cr) override {
-        if (!current_icon) return;
-
+    void draw(cairo_t *cr) override {
+        if (!current_icon_) {
+			return;
+		}
         auto [x, y] = xy(cr);
-		drawStrokeIcon(cr, current_icon, x, y, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
+		cairo_save(cr);
+        cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 1.0);
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                if (dx * dx + dy * dy > 1 * 1)
+                    continue;
+                cairo_mask_surface(cr, current_icon_, x + dx, y + dy);
+            }
+        }
+        cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+        cairo_mask_surface(cr, current_icon_, x, y);
+        cairo_restore(cr);
+    }
+
+    void setFact(uint idx, Fact fact) override {
+        assert(idx == 0);
+        cairo_surface_t *icon = selectIcon(fact);
+        if (icon == current_icon_) {
+            return;
+        }
+        current_icon_ = icon;
+        invalidateMeasure();
     }
 
 private:
@@ -1404,7 +1926,7 @@ private:
         }
 
         // Iterate through the configured ranges and select the appropriate icon
-        for (const auto& [range, icon] : icon_cache) {
+        for (const auto& [range, icon] : icon_cache_) {
             if (value >= range.first && value <= range.second) {
                 return icon;
             }
@@ -1414,18 +1936,123 @@ private:
     }
 
     cairo_surface_t* openIcon(const std::filesystem::path& icon_path) {
-        std::filesystem::path full_path = assets_dir / icon_path;
+        std::filesystem::path full_path = assets_dir_ / icon_path;
         cairo_surface_t* icon = cairo_image_surface_create_from_png(full_path.c_str());
         if (cairo_surface_status(icon) != CAIRO_STATUS_SUCCESS) {
             spdlog::error("Failed to open icon: {}", full_path.string());
+			cairo_surface_destroy(icon);
             return nullptr;
         }
         return icon;
     }
 
-    std::map<std::pair<int, int>, cairo_surface_t*> icon_cache; // Cache of loaded icons
-    std::filesystem::path assets_dir;
-    cairo_surface_t* current_icon = nullptr; // Currently selected icon
+    std::map<std::pair<int, int>, cairo_surface_t*> icon_cache_; // Cache of loaded icons
+    std::filesystem::path assets_dir_;
+    cairo_surface_t* current_icon_ = nullptr; // Currently selected icon
+};
+
+//
+// Layouts
+//
+
+class Layout {
+public:
+    Layout(int pos_x, int pos_y, int spacing) : pos_x_(pos_x), pos_y_(pos_y), spacing_(spacing) {}
+
+    virtual ~Layout() = default;
+
+    Layout(const Layout&) = delete;
+    Layout& operator=(const Layout&) = delete;
+
+    void addWidget(Widget *widget) {
+        widgets_.push_back(widget);
+        dirty_ = true;
+    }
+
+    void invalidate() {
+        dirty_ = true;
+    }
+
+    bool dirty() const {
+        return dirty_;
+    }
+
+    void update(cairo_t *cr) {
+        if (!dirty_) {
+            return;
+        }
+        doUpdate(cr);
+        dirty_ = false;
+    }
+
+protected:
+    virtual void doUpdate(cairo_t *cr) = 0;
+
+    int x(cairo_t *cr) const {
+        cairo_surface_t *target = cairo_get_target(cr);
+        int width = cairo_image_surface_get_width(target);
+        return (width + pos_x_) % width;
+    }
+
+    int y(cairo_t *cr) const {
+        cairo_surface_t *target = cairo_get_target(cr);
+        int height = cairo_image_surface_get_height(target);
+        return (height + pos_y_) % height;
+    }
+
+    const std::vector<Widget*>& widgets() const {
+        return widgets_;
+    }
+
+    int spacing() const {
+        return spacing_;
+    }
+
+private:
+    int pos_x_;
+    int pos_y_;
+    int spacing_;
+
+    bool dirty_ = true;
+    std::vector<Widget*> widgets_;
+};
+
+class HorizontalLayout : public Layout {
+public:
+    enum class Direction {
+        LeftToRight,
+        RightToLeft
+    };
+
+    HorizontalLayout(int pos_x, int pos_y, int spacing, Direction direction) : 
+		Layout(pos_x, pos_y, spacing), direction_(direction) {}
+
+protected:
+	void doUpdate(cairo_t *cr) override {
+        int cursor_x = x(cr);
+        const int pos_y = y(cr);
+        const bool rtl = direction_ == Direction::RightToLeft;
+        bool first = true;
+        for (Widget *widget : widgets()) {
+            if (widget->width() == 0 && widget->height() == 0) {
+                continue;
+            }
+            if (!first) {
+                cursor_x += rtl ? -spacing() : spacing();
+            }
+            if (rtl) {
+                cursor_x -= widget->width();
+            }
+            widget->setPosition(cursor_x, pos_y);
+            if (!rtl) {
+                cursor_x += widget->width();
+            }
+            first = false;
+        }
+    }
+
+private:
+    Direction direction_;
 };
 
 class Osd {
@@ -1474,11 +2101,11 @@ public:
 				matchers.push_back(FactMatcher(matcher_name, tags));
 			}
 			if (type == "TextWidget") {
-				addWidget(new TextWidget(x, y, widget_j.at("text").template get<std::string>()),
+				addWidget(std::make_unique<TextWidget>(x, y, widget_j.at("text").template get<std::string>()),
 						  matchers);
 			}
 			else if (type == "ExternalSurfaceWidget") {
-				addWidget(new ExternalSurfaceWidget(x, y, name), matchers);
+				addWidget(std::make_unique<ExternalSurfaceWidget>(x, y, name), matchers);
 			} else if (type == "IconSelectorWidget") {
 				std::vector<std::pair<std::pair<int, int>, std::filesystem::path>> ranges_and_icons;
 				for (const auto& range_icon : widget_j.at("ranges_and_icons")) {
@@ -1487,38 +2114,40 @@ public:
 					std::filesystem::path icon_path = range_icon.at("icon_path");
 					ranges_and_icons.push_back({{range_start, range_end}, icon_path});
 				}
-				addWidget(new IconSelectorWidget(x, y, ranges_and_icons, assets_dir), matchers);
+				addWidget(std::make_unique<IconSelectorWidget>(x, y, ranges_and_icons, assets_dir), matchers);
 			} else if (type == "TplTextWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
-				addWidget(new TplTextWidget(x, y, tpl, (uint)matchers.size()), matchers);
+				addWidget(std::make_unique<TplTextWidget>(x, y, tpl, (uint)matchers.size()), matchers);
 			} else if(type == "IconTplTextWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
-				addWidget(new IconTplTextWidget(x, y, icon, tpl, (uint)matchers.size()), matchers);
+				addWidget(std::make_unique<IconTplTextWidget>(x, y, icon, tpl, (uint)matchers.size()), matchers);
 			} else if(type == "DvrStatusWidget") {
+				auto id = widget_j.at("id").get<std::string>();
 				auto text = widget_j.at("text").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
-				addWidget(new DvrStatusWidget(x, y, icon, text), matchers);
+				addWidget(std::make_unique<DvrStatusWidget>(x, y, icon, text), matchers, id);
 			} else if (type == "DvrStorageWidget") {
+				auto id = widget_j.at("id").get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
-				if (icon == NULL) break;
-				addWidget(new DvrStorageWidget(x, y, icon), matchers);
+				if (icon == NULL) break;		
+				addWidget(std::make_unique<DvrStorageWidget>(x, y, icon), matchers, id);
 			} else if(type == "IconStatusWidget") {
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
-				addWidget(new IconStatusWidget(x, y, icon), matchers);
+				addWidget(std::make_unique<IconStatusWidget>(x, y, icon), matchers);
 			} else if (type == "IconTplStatusWidget") {
     			auto tpl = widget_j.at("template").template get<std::string>();
     			auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
     			cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
     			if (icon == NULL) break;
-    			addWidget(new IconTplStatusWidget(x, y, icon, tpl, (uint)matchers.size()), matchers);
+    			addWidget(std::make_unique<IconTplStatusWidget>(x, y, icon, tpl, (uint)matchers.size()), matchers);
 			} else if(type == "VideoWidget") {
 				auto tpl = widget_j.at("template").template get<std::string>();
 				auto icon_path = widget_j.at("icon_path").template get<std::filesystem::path>();
@@ -1527,7 +2156,7 @@ public:
                 uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
-				addWidget(new VideoWidget(x, y, window_size_s * 1000, bucket_size_ms,
+				addWidget(std::make_unique<VideoWidget>(x, y, window_size_s * 1000, bucket_size_ms,
                                           icon, tpl, refresh_rate_ms, (uint)matchers.size()),
 						  matchers);
 			} else if(type == "VideoBitrateWidget") {
@@ -1538,7 +2167,7 @@ public:
                 uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
-				addWidget(new VideoBitrateWidget(x, y, window_size_s * 1000, bucket_size_ms,
+				addWidget(std::make_unique<VideoBitrateWidget>(x, y, window_size_s * 1000, bucket_size_ms,
                                                  icon, tpl, refresh_rate_ms, (uint)matchers.size()),
 						  matchers);
 			} else if(type == "VideoDecodeLatencyWidget") {
@@ -1549,7 +2178,7 @@ public:
                 uint refresh_rate_ms = widget_j.value("refresh_rate_ms", refresh_frequency_ms);
 				cairo_surface_t *icon = openIcon(name, assets_dir, icon_path);
 				if (icon == NULL) break;
-				addWidget(new VideoDecodeLatencyWidget(x, y, window_size_s * 1000, bucket_size_ms,
+				addWidget(std::make_unique<VideoDecodeLatencyWidget>(x, y, window_size_s * 1000, bucket_size_ms,
                                                        icon, tpl, refresh_rate_ms, 1),
 						  matchers);
 			} else if(type == "BoxWidget") {
@@ -1560,7 +2189,7 @@ public:
 				auto g = color_j.at("g").template get<double>();
 				auto b = color_j.at("b").template get<double>();
 				auto a = color_j.at("alpha").template get<double>();
-				addWidget(new BoxWidget(x, y, width, height, r, g, b, a), matchers);
+				addWidget(std::make_unique<BoxWidget>(x, y, width, height, CairoColor{r, g, b, a}), matchers);
 			} else if(type == "BarChartWidget") {
 				auto width = widget_j.at("width").template get<uint>();
 				auto height = widget_j.at("height").template get<uint>();
@@ -1582,33 +2211,124 @@ public:
 					SPDLOG_WARN("{}: invalid stats_kind {}", name, stats_kind_str);
 					break;
 				}
-				addWidget(new BarChartWidget(x, y, width, height, window_s, num_buckets, stats_kind),
+				addWidget(std::make_unique<BarChartWidget>(x, y, width, height, window_s, num_buckets, stats_kind),
 						  matchers);
 			} else if (type == "GPSWidget") {
-				addWidget(new GPSWidget(x, y, (uint)matchers.size()), matchers);
+				addWidget(std::make_unique<GPSWidget>(x, y, (uint)matchers.size()), matchers);
 			} else if(type == "PopupWidget") {
 				auto timeout_ms = widget_j.at("timeout_ms").template get<uint>();
-				addWidget(new PopupWidget(x, y, timeout_ms, (uint)matchers.size()),
+				addWidget(std::make_unique<PopupWidget>(x, y, timeout_ms, (uint)matchers.size()),
 						  matchers);
 			} else if(type == "DebugWidget") {
-				addWidget(new DebugWidget(x, y, (uint)matchers.size()), matchers);
+				addWidget(std::make_unique<DebugWidget>(x, y, (uint)matchers.size()), matchers);
 			} else {
 				spdlog::warn("Widget '{}': unknown type: {}", name, type);
 			}
 		}
+		if (cfg.contains("layouts")) {
+			json layouts_j = cfg.at("layouts");
+			for (json layout_json : layouts_j) {
+				if (!layout_json.contains("type") || !layout_json.contains("x") || 
+					!layout_json.contains("y") || !layout_json.contains("spacing")) {
+					spdlog::error("Invalid layout configuration");
+					return;
+				}
+				const auto type = layout_json.at("type").get<std::string>();
+				const auto x = layout_json.at("x").get<int>();
+				const auto y = layout_json.at("y").get<int>();
+				const auto spacing = layout_json.at("spacing").get<int>();
+
+				std::unique_ptr<Layout> layout;
+				if (type == "horizontal") {
+					if (!layout_json.contains("direction")) {
+						spdlog::error("Horizontal layout has no direction");
+						return;
+					}
+					const auto direction = layout_json.at("direction").get<std::string>();
+					HorizontalLayout::Direction dir;
+					if (direction == "left-to-right") {
+						dir = HorizontalLayout::Direction::LeftToRight;
+					} else if (direction == "right-to-left") {
+						dir = HorizontalLayout::Direction::RightToLeft;
+					} else {
+						spdlog::error("Unknown horizontal layout direction '{}'", direction);
+						continue;
+					}
+					layout = std::make_unique<HorizontalLayout>(x, y, spacing, dir);
+				} else {
+					spdlog::error("Unknown layout type '{}'", type);
+					continue;
+				}
+				if (!layout_json.contains("widgets")) {
+					spdlog::error("Layout has no widgets");
+					return;
+				}
+				Layout *layout_ptr = layout.get();
+				json widget_ids_j = layout_json.at("widgets");
+				for (json widget_id_json : widget_ids_j) {
+					const auto widget_id = widget_id_json.get<std::string>();
+					auto it = widgets_by_id.find(widget_id);
+					if (it == widgets_by_id.end()) {
+						spdlog::error("Layout references unknown widget '{}'", widget_id);
+						continue;
+					}
+					addWidgetToLayout(layout_ptr, it->second);
+				}
+				layouts.push_back(std::move(layout));
+			}
+		}
 	}
 
-	Osd *addWidget(Widget *widget, std::vector<FactMatcher> param_matchers) {
+	Osd *addWidget(std::unique_ptr<Widget> widget, std::vector<FactMatcher> param_matchers, const std::string& id = "") {
 		uint arg_idx = 0;
-		widgets.push_back(widget);
+		Widget *widget_ptr = widget.get();
+		widgets.push_back(std::move(widget));
 		for (auto matcher : param_matchers) {
-			matchers.push_back(std::make_tuple(matcher, widget, arg_idx));
+			matchers.push_back(std::make_tuple(matcher, widget_ptr, arg_idx));
 			arg_idx++;
+		}
+		if (!id.empty()) {
+			if (widgets_by_id.find(id) != widgets_by_id.end()) {
+				spdlog::error("Duplicate widget id '{}'", id);
+			} else {
+				widgets_by_id[id] = widget_ptr;
+			}
 		}
 		return this;
 	};
 
+	void addWidgetToLayout(Layout *layout, Widget *widget) {
+		layout->addWidget(widget);
+		widget_layouts[widget].push_back(layout);
+	}
+
+	void measureWidgets(cairo_t* cr) {
+		for (auto& widget : widgets) {
+			if (!widget->measureDirty()) {
+				continue;
+			}
+			const int old_width = widget->width();
+			const int old_height = widget->height();
+
+			widget->measure(cr);
+			if (old_width == widget->width() && old_height == widget->height()) {
+				continue;
+			}
+			auto it = widget_layouts.find(widget.get());
+			if (it == widget_layouts.end()) {
+				continue;
+			}
+			for (Layout *layout : it->second) {
+				layout->invalidate();
+			}
+		}
+	}
+
 	void draw(cairo_t *cr) {
+		measureWidgets(cr);
+		for (auto &layout : layouts) {
+			layout->update(cr);
+		}
 		for(auto &widget : widgets)
 			widget->draw(cr);
 	};
@@ -1672,7 +2392,12 @@ private:
 		return icon;
 	}
 
-	std::vector<Widget *> widgets;
+	
+	std::vector<std::unique_ptr<Layout>> layouts;
+	std::unordered_map<Widget*, std::vector<Layout*>> widget_layouts;
+	std::unordered_map<std::string, Widget*> widgets_by_id;
+
+	std::vector<std::unique_ptr<Widget>> widgets;
 	std::vector<std::tuple<FactMatcher, Widget *, uint>> matchers;
     cairo_surface_t * screensaver_image = nullptr;
 };
