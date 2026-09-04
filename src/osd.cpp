@@ -18,6 +18,7 @@ extern "C" {
 #include <chrono>
 #include <deque>
 #include <cstdlib> //KILLME
+#include <ctime>
 #include <string>
 #include <filesystem>
 #include <cairo.h>
@@ -1127,7 +1128,7 @@ public:
         updateTime();
 
         auto [x, y] = xy(cr);
-        drawStrokeText(cr, x, y, time_, CairoColor{1, 1, 1, 0.8}, CairoColor{0, 0, 0, 1}, 1.0);
+        drawStrokeText(cr, x, y, time_, CairoColor{0.8, 0.8, 0.8, 1}, CairoColor{0, 0, 0, 1}, 1.0);
     }
 
 private:
