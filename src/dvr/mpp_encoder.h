@@ -19,6 +19,10 @@ public:
     int  get_hor_stride() const { return cfg_hor_stride; }
     int  get_ver_stride() const { return cfg_ver_stride; }
 
+    // Encode the next submitted frame as an IDR. The DVR uses this to place keyframes on the media
+    // timeline; see the note on KEYFRAME_INTERVAL_90K in dvr.cpp.
+    void request_idr();
+
     int submit(MppBuffer buf, int64_t pts, int width, int height,
                int hor_stride, int ver_stride);
     void drain(const std::function<void(const uint8_t *, int)> &on_nal);

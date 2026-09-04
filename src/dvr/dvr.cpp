@@ -45,6 +45,10 @@ static const int MS_TO_90K       = 90;     // 1 ms = 90 ticks at 90kHz
 // frames are unaffected; it only bounds the pathological case.
 static const int MAX_FRAME_DURATION_90K = TS_TIMEBASE_90K / 4;
 
+// Active keyframe clock, in media time - correct at any capture rate. Sets seek granularity: TS has
+// no index, so a player starts at a keyframe.
+static const int64_t KEYFRAME_INTERVAL_90K = 500 * (int64_t)MS_TO_90K;
+
 //Periodic storage guard check runs during recording (free-space / mount check).
 static const int64_t  STORAGE_CHECK_INTERVAL_MS = 3000;
 
@@ -594,6 +598,14 @@ MppBuffer Dvr::import_decoder_buffer(const dvr_frame_info &info) {
     return dec_buf;
 }
 
+void Dvr::maybe_request_idr() {
+    if (segment_video_ticks - last_idr_ticks < KEYFRAME_INTERVAL_90K) {
+        return;
+    }
+    encoder.request_idr();
+    last_idr_ticks = segment_video_ticks;
+}
+
 void Dvr::encode_and_write_wb(dvr_frame_info info) {
     // 1) Wait for the VOP to finish writing the composited frame into this WB buffer.
     if (info.fence_fd >= 0) {
@@ -628,6 +640,7 @@ void Dvr::encode_and_write_wb(dvr_frame_info info) {
         frame_error_streak++;
         return;
     }
+    maybe_request_idr();
     int ret = encoder.submit(buf, (int64_t)info.pts,
                              (int)wb_enc_width, (int)wb_enc_height,
                              (int)wb_enc_hor_stride, (int)wb_enc_ver_stride);
@@ -672,6 +685,7 @@ void Dvr::encode_and_write(dvr_frame_info info) {
         frame_error_streak++;
         return;
     }
+    maybe_request_idr();
     int ret = encoder.submit(buf, (int64_t)info.pts,
                              (int)info.width, (int)info.height,
                              (int)info.hor_stride, (int)info.ver_stride);
@@ -741,6 +755,7 @@ void Dvr::finalize_current_file() {
     }
     current_filename.clear();
     segment_video_ticks = 0;
+    last_idr_ticks = 0;
 }
 
 void Dvr::stop() {

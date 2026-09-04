@@ -48,6 +48,7 @@ private:
     MppBuffer import_decoder_buffer(const dvr_frame_info &info);
     void encode_and_write(dvr_frame_info info);
     void encode_and_write_wb(dvr_frame_info info);
+    void maybe_request_idr();
     void update_storage_status(bool force_update);
 
     std::queue<dvr_rpc> dvrQueue;
@@ -58,6 +59,7 @@ private:
     int  dvr_bitrate = 8000000;
     int64_t segment_limit_ms = 0;
     int64_t segment_video_ticks = 0;
+    int64_t last_idr_ticks = 0;
     RecordingMode mode = RecordingMode::VideoOnly;
 
     std::string rec_dir;

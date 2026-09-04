@@ -8,7 +8,10 @@
 
 #include "mpp_encoder.h"
 
-static const int GOP_SECONDS = 2; // keyframe interval
+// Backstop only, and a frame COUNT (rc:gop = fps * this), so its real-time interval drifts with the
+// capture rate. The DVR's KEYFRAME_INTERVAL_90K in dvr.cpp is the active clock and always fires
+// first; this just guarantees keyframes if request_idr() ever stops working.
+static const int GOP_SECONDS = 2;
 
 bool MppEncoder::init(int width, int height, int hor_stride, int ver_stride,
                       int fps, int bitrate) {
@@ -104,6 +107,13 @@ void MppEncoder::sync_strides(int hor_stride, int ver_stride) {
     mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", ver_stride);
     mpi->control(ctx, MPP_ENC_SET_CFG, cfg);
     spdlog::info("[ DVR MppEncoder ] zero-copy strides synced to {}x{}", hor_stride, ver_stride);
+}
+
+void MppEncoder::request_idr() {
+    if (!ctx) {
+        return;
+    }
+    mpi->control(ctx, MPP_ENC_SET_IDR_FRAME, nullptr);
 }
 
 int MppEncoder::submit(MppBuffer buf, int64_t pts, int width, int height,
