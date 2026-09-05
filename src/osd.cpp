@@ -872,7 +872,7 @@ public:
 	void draw(cairo_t *cr) {
 		if(args[0].isDefined() && args[0].getBoolValue()) {
 			auto [x, y] = xy(cr);
-			drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 1.0, 1.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
+			drawStrokeIcon(cr, icon, x, y - 20, CairoColor{1.0, 0.0, 0.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 1);
 			drawStrokeText(cr, x + 40, y, text, CairoColor{1.0, 0.0, 0.0, 1.0}, CairoColor{0.0, 0.0, 0.0, 1.0}, 2.0);
 		}
 	}
@@ -924,10 +924,10 @@ private:
         };
 
         static constexpr StorageUnit units[] = {
-            {1ULL << 40, "TiB"},
-            {1ULL << 30, "GiB"},
-            {1ULL << 20, "MiB"},
-            {1ULL << 10, "KiB"},
+            {1ULL << 40, "T"},
+            {1ULL << 30, "G"},
+            {1ULL << 20, "M"},
+            {1ULL << 10, "K"},
         };
 
         const StorageUnit *unit = &units[3];

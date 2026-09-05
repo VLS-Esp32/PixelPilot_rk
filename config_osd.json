@@ -86,17 +86,6 @@
       ]
     },
     {
-      "name": "DVR status",
-      "type": "DvrStatusWidget",
-      "x": -90,
-      "y": 35,
-      "icon_path": "sdcard-white.png",
-      "text": "Rec",
-      "facts": [
-        { "name": "dvr.recording" }
-      ]
-    },
-    {
       "name": "msposd",
       "type": "ExternalSurfaceWidget",
       "x": 0,
