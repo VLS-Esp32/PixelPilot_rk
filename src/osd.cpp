@@ -1200,6 +1200,8 @@ public:
     }
 
 private:
+    static constexpr int MIN_VALID_YEAR = 2026;
+
 	void updateTime() {
 		const auto now = std::chrono::steady_clock::now();
         if (now - last_update_ < std::chrono::seconds(1)) {
@@ -1212,6 +1214,12 @@ private:
 
         std::tm tm{};
         if (localtime_r(&time, &tm) == nullptr) {
+            return;
+        }
+
+		const int year = tm.tm_year + 1900;
+        if (year < MIN_VALID_YEAR) {
+            time_ = "---- -- -- --:--:--";
             return;
         }
 
