@@ -53,6 +53,17 @@
       ]
     },
     {
+      "name": "DVR storage",
+      "type": "DvrStorageWidget",
+      "x": 850,
+      "y": -24,
+      "icon_path": "hard-drive.png",
+      "facts": [
+        { "name": "dvr.storage_status" },
+        { "name": "dvr.storage_available_bytes" }     
+      ]
+    },
+    {
       "name": "WFB client status",
       "type": "IconTplStatusWidget",
       "x": -75,
@@ -72,17 +83,6 @@
       "icon_path": "drone.png",
       "facts": [
         { "name": "wfbcli.drone.connected" }
-      ]
-    },
-    {
-      "name": "DVR status",
-      "type": "DvrStatusWidget",
-      "x": -90,
-      "y": 35,
-      "icon_path": "sdcard-white.png",
-      "text": "Rec",
-      "facts": [
-        { "name": "dvr.recording" }
       ]
     },
     {

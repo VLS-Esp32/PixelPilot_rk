@@ -15,6 +15,8 @@
 #include "rtp-demuxer.h"
 #include "common.h"
 
+extern int signal_flag;
+
 static VideoCodec detect_rtp_codec(const uint8_t* payload, int payload_len)
 {
     if (!payload || payload_len < 64)
@@ -71,11 +73,13 @@ static VideoCodec detect_rtp_codec(const uint8_t* payload, int payload_len)
 
     if (h265_f == 0 && h265_tid_p != 0) {
         // --- Single NAL unit packet ---
-        //   19, 20 - IDR slices
+        //   0-21  - VCL slices: non-IDR TRAIL/TSA/STSA/RADL/RASL (0-9) + IRAP BLA/IDR/CRA (16-21).
+        //           Recognizing non-IDR (P) slices — not just IDR — is what makes H265 detection
+        //           as fast as H264; otherwise detection stalls until a keyframe/parameter set.
         //   32     - VPS
         //   33     - SPS
         //   34     - PPS
-        if (h265_type == 19 || h265_type == 20 || h265_type == 32 || h265_type == 33 || h265_type == 34) {
+        if (h265_type <= 21 || h265_type == 32 || h265_type == 33 || h265_type == 34) {
             h265_found = true;
         }
 
@@ -86,7 +90,7 @@ static VideoCodec detect_rtp_codec(const uint8_t* payload, int payload_len)
             uint8_t fu_e = (fu_hdr >> 6) & 0x01;
             uint8_t fu_type = fu_hdr & 0x3F; // 6-bit FuType
 
-            if (fu_s && !fu_e && (fu_type == 19 || fu_type == 20)) {
+            if (fu_s && !fu_e && fu_type <= 21) { // any VCL slice (non-IDR + IDR)
                 h265_found = true;
             }
         }
@@ -98,6 +102,26 @@ static VideoCodec detect_rtp_codec(const uint8_t* payload, int payload_len)
         return VideoCodec::H265;
 
     return VideoCodec::UNKNOWN;
+}
+
+VideoCodec rtp_classify_codec(const uint8_t *pkt, int len)
+{
+    if (!pkt || len < 12) // RTP fixed header is 12 bytes
+        return VideoCodec::UNKNOWN;
+
+    int  csrc_count       = pkt[0] & 0x0F;
+    bool has_extension    = (pkt[0] >> 4) & 0x01;
+    int  payload_offset   = 12 + csrc_count * 4;
+    if (has_extension) {
+        if (len < payload_offset + 4)
+            return VideoCodec::UNKNOWN;
+        int extension_words = (pkt[payload_offset + 2] << 8) | pkt[payload_offset + 3];
+        payload_offset += 4 + extension_words * 4;
+    }
+    if (len <= payload_offset)
+        return VideoCodec::UNKNOWN;
+
+    return detect_rtp_codec(pkt + payload_offset, len - payload_offset);
 }
 
 // callback for codec detection, called until the codec is found
@@ -131,8 +155,7 @@ VideoCodec RtpCodecDecoder::detect_codec(int socket_fd)
         return VideoCodec::UNKNOWN;
     }
 
-    // Wait until codec is detected (single-thread, blocking)
-    while (m_running->load() && detected_codec == VideoCodec::UNKNOWN) {
+    while (m_running->load() && !signal_flag && detected_codec == VideoCodec::UNKNOWN) {
         int ret = poll(fds, 1, 5000);
         if (ret < 0) { if (errno == EINTR) continue; perror("poll"); break; }
         if (ret == 0) continue;

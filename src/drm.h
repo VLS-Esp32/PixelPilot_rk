@@ -39,6 +39,7 @@ struct modeset_buf {
 	uint32_t size;
 	uint32_t handle;
 	uint8_t *map;
+	int      prime_fd;
 	uint32_t fb;
 };
 
@@ -71,6 +72,10 @@ struct modeset_output {
     uint64_t decoding_pts;
 	int video_poc;
 
+	struct drm_object wb_connector;
+	bool wb_available;
+	bool wb_enabled;
+
 	bool cleanup;
 };
 
@@ -85,7 +90,6 @@ int set_drm_object_property(drmModeAtomicReq *req, struct drm_object *obj,  cons
 
 int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn, struct modeset_output *out);
 
-const char* drm_fourcc_to_string(uint32_t fourcc);
 
 int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *plane_out, uint32_t plane_format);
 
@@ -98,6 +102,20 @@ void modeset_destroy_objects(int fd, struct modeset_output *out);
 int modeset_create_fb(int fd, struct modeset_buf *buf);
 
 void modeset_destroy_fb(int fd, struct modeset_buf *buf);
+
+int modeset_find_writeback(int fd, struct modeset_output *out);
+
+int modeset_create_wb_fb(int fd, struct modeset_buf *buf);
+
+void modeset_destroy_wb_fb(int fd, struct modeset_buf *buf);
+
+int modeset_attach_writeback(int fd, struct modeset_output *out);
+
+void modeset_detach_writeback(int fd, struct modeset_output *out);
+
+int modeset_check_writeback(int fd, struct modeset_output *out, uint32_t wb_fb);
+
+int modeset_arm_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr);
 
 int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_output *out);
 

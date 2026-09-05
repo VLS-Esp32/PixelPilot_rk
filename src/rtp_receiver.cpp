@@ -7,7 +7,6 @@
 
 #include "spdlog/spdlog.h"
 #include <cstring>
-#include <chrono>
 #include <stdexcept>
 #include <cassert>
 #include <sstream>
@@ -20,6 +19,9 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <iostream>
+
+extern int signal_flag;
+
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
@@ -33,6 +35,8 @@
 extern "C" {
 #include "osd.h"
 }
+
+static const int CODEC_MISMATCH_CONFIRM = 5;
 
 // Main callback for packet processing after codec is known
 static int main_rtp_cb(void* param, const void* packet, int bytes, uint32_t timestamp, int flags)
@@ -57,19 +61,7 @@ static int main_rtp_cb(void* param, const void* packet, int bytes, uint32_t time
         spdlog::debug("\n");
     }
 #endif
-    static auto prev_time = std::chrono::steady_clock::now();
-    auto current_time = std::chrono::steady_clock::now();
-    // check difference between packets more then 30 sec if true check if new codec is present
-    if (std::chrono::duration_cast<std::chrono::seconds>(current_time - prev_time).count() > 30) {
-        spdlog::info("[ RTP ] Time gap between packets more than 30 seconds. Checking new codec...");
-        if (rtp_receiver->new_codec_detected()) {
-            rtp_receiver->m_cb((void*)packet, bytes, true);
-        }
-    }
-    else {
-        rtp_receiver->m_cb((void*)packet, bytes, false);
-    }
-    prev_time = current_time;
+    rtp_receiver->m_cb((void*)packet, bytes, false);
 
     return 0;
 }
@@ -125,6 +117,11 @@ void RtpReceiver::init()
         m_running->store(true);
         m_video_codec = m_codec_detector->detect_codec(m_socket_handler->get_socket_fd());
         if (m_video_codec == VideoCodec::UNKNOWN) {
+            if (signal_flag) {
+                spdlog::info("[ RTP ] Codec detection aborted (shutdown requested)");
+                m_running->store(false);
+                return;
+            }
             spdlog::error("[ RTP ] Failed to detect codec");
             assert(false);
         }
@@ -166,6 +163,20 @@ void RtpReceiver::rtp_receiver_thread()
             struct sockaddr_in peer; socklen_t len = sizeof(peer);
             ssize_t n = recvfrom(m_socket, buffer, sizeof(buffer), 0, (struct sockaddr*)&peer, &len);
             if (n > 0) {
+                VideoCodec packet_codec = rtp_classify_codec(buffer, (int)n);
+                if (packet_codec != VideoCodec::UNKNOWN && packet_codec != m_video_codec) {
+                    m_codec_mismatch_count++;
+                    if (m_codec_mismatch_count >= CODEC_MISMATCH_CONFIRM) {
+                        spdlog::info("[ RTP ] Stream codec changed {} -> {}",
+                                     codec_type_name(m_video_codec), codec_type_name(packet_codec));
+                        m_video_codec = packet_codec;
+                        m_codec_mismatch_count = 0;
+                        m_cb(nullptr, 0, true);
+                        continue;
+                    }
+                } else if (packet_codec == m_video_codec) {
+                    m_codec_mismatch_count = 0;
+                }
                 rtp_demuxer_input(demuxer, buffer, (int)n);
             }
         }
@@ -181,16 +192,4 @@ void RtpReceiver::rtp_receiver_thread()
 VideoCodec RtpReceiver::get_video_codec()
 {
     return m_video_codec;
-}
-
-
-bool RtpReceiver::new_codec_detected()
-{
-    VideoCodec new_codec = m_codec_detector->detect_codec(m_socket_handler->get_socket_fd());
-    if (new_codec != VideoCodec::UNKNOWN && m_video_codec != new_codec) {
-        m_video_codec = new_codec;
-        spdlog::info("[ RTP ] New codec detected: {}", codec_type_name(m_video_codec));
-        return true;
-    }
-    return false;
 }

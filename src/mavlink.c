@@ -25,11 +25,12 @@
 #include "mavlink.h"
 #include "osd.h"
 
-// Declare the C-compatible interface to cpp dvr functions
-typedef struct Dvr* Dvr; // Forward declaration
-void dvr_start_recording(Dvr* dvr);
-void dvr_stop_recording(Dvr* dvr);
-extern Dvr *dvr;
+// C-compatible interface to the C++ Dvr object. `Dvr` is opaque here - the pointer is only ever
+// handed straight back to the shims, which are defined in dvr.cpp under extern "C".
+struct Dvr;
+void dvr_start_recording(struct Dvr *dvr);
+void dvr_stop_recording(struct Dvr *dvr);
+extern struct Dvr *dvr;
 
 #define earthRadiusKm 6371.0
 #define BILLION 1000000000L

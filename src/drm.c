@@ -18,6 +18,14 @@
 #include <rockchip/rk_mpi.h>
 #include <assert.h>
 
+// Header-name compatibility for older libdrm uapi headers.
+#ifndef DRM_CLIENT_CAP_WRITEBACK_CONNECTORS
+#define DRM_CLIENT_CAP_WRITEBACK_CONNECTORS 5
+#endif
+#ifndef DRM_MODE_CONNECTOR_WRITEBACK
+#define DRM_MODE_CONNECTOR_WRITEBACK 18
+#endif
+
 int modeset_open(int *out, const char *node)
 {
 	int fd, ret;
@@ -40,6 +48,12 @@ int modeset_open(int *out, const char *node)
 	if (ret) {
 		fprintf(stderr, "failed to set atomic cap, %d", ret);
 		return ret;
+	}
+
+	// Opt in to writeback connectors — they are hidden from enumeration otherwise. Non-fatal:
+	// if the kernel lacks writeback support, OSD-in-DVR simply records clean video (no OSD).
+	if (drmSetClientCap(fd, DRM_CLIENT_CAP_WRITEBACK_CONNECTORS, 1) != 0) {
+		fprintf(stdout, "writeback-connectors cap unavailable (DVR writeback capture disabled)\n");
 	}
 
 	if (drmGetCap(fd, DRM_CAP_DUMB_BUFFER, &cap) < 0 || !cap) {
@@ -203,16 +217,6 @@ int modeset_find_crtc(int fd, drmModeRes *res, drmModeConnector *conn, struct mo
 	return -ENOENT;
 }
 
-const char* drm_fourcc_to_string(uint32_t fourcc) {
-    char* result = malloc(5);
-    result[0] = (char)((fourcc >> 0) & 0xFF);
-    result[1] = (char)((fourcc >> 8) & 0xFF);
-    result[2] = (char)((fourcc >> 16) & 0xFF);
-    result[3] = (char)((fourcc >> 24) & 0xFF);
-    result[4] = '\0';
-    return result;
-}
-
 int modeset_find_plane(int fd, struct modeset_output *out, struct drm_object *plane_out, uint32_t plane_format)
 {
 	drmModePlaneResPtr plane_res;
@@ -303,6 +307,8 @@ void modeset_destroy_objects(int fd, struct modeset_output *out)
 	modeset_drm_object_fini(&out->crtc);
 	modeset_drm_object_fini(&out->video_plane);
 	modeset_drm_object_fini(&out->osd_plane);
+	if (out->wb_connector.props)
+		modeset_drm_object_fini(&out->wb_connector);
 }
 
 
@@ -314,6 +320,7 @@ int modeset_create_fb(int fd, struct modeset_buf *buf)
 	int ret;
 	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
 
+	buf->prime_fd = -1;
 	memset(&creq, 0, sizeof(creq));
 	creq.width = buf->width;
 	creq.height = buf->height;
@@ -359,10 +366,20 @@ int modeset_create_fb(int fd, struct modeset_buf *buf)
 		goto err_fb;
 	}
 
+	ret = drmPrimeHandleToFD(fd, buf->handle, DRM_CLOEXEC | DRM_RDWR, &buf->prime_fd);
+	if (ret) {
+		fprintf(stderr, "cannot export prime fd (%d): %m\n", errno);
+		ret = -errno;
+		goto err_unmap;
+	}
+
 	memset(buf->map, 0, buf->size);
 
 	return 0;
 
+err_unmap:
+	munmap(buf->map, buf->size);
+	buf->map = NULL;
 err_fb:
 	drmModeRmFB(fd, buf->fb);
 err_destroy:
@@ -377,6 +394,11 @@ void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 {
 	struct drm_mode_destroy_dumb dreq;
 
+	if (buf->prime_fd >= 0) {
+		close(buf->prime_fd);
+		buf->prime_fd = -1;
+	}
+
 	munmap(buf->map, buf->size);
 
 	drmModeRmFB(fd, buf->fb);
@@ -386,6 +408,272 @@ void modeset_destroy_fb(int fd, struct modeset_buf *buf)
 	drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 }
 
+
+int modeset_find_writeback(int fd, struct modeset_output *out)
+{
+	out->wb_available = false;
+    out->wb_enabled = false;
+	out->wb_connector.props = NULL;
+
+	drmModeRes *res = drmModeGetResources(fd);
+	if (!res) {
+		fprintf(stderr, "modeset_find_writeback: cannot get resources: %m\n");
+		return -ENOENT;
+	}
+
+	for (int i = 0; i < res->count_connectors && !out->wb_available; i++) {
+		drmModeConnector *conn = drmModeGetConnector(fd, res->connectors[i]);
+		if (!conn)
+			continue;
+		if (conn->connector_type != DRM_MODE_CONNECTOR_WRITEBACK) {
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		// The writeback connector's encoder must be able to drive our CRTC.
+		bool crtc_ok = false;
+		for (int e = 0; e < conn->count_encoders && !crtc_ok; e++) {
+			drmModeEncoder *enc = drmModeGetEncoder(fd, conn->encoders[e]);
+			if (!enc)
+				continue;
+			if (enc->possible_crtcs & (1 << out->crtc_index))
+				crtc_ok = true;
+			drmModeFreeEncoder(enc);
+		}
+		if (!crtc_ok) {
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		out->wb_connector.id = conn->connector_id;
+		modeset_get_object_properties(fd, &out->wb_connector, DRM_MODE_OBJECT_CONNECTOR);
+		if (!out->wb_connector.props) {
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+		int64_t fb_prop    = get_property_value(fd, out->wb_connector.props, "WRITEBACK_FB_ID");
+		int64_t fence_prop = get_property_value(fd, out->wb_connector.props, "WRITEBACK_OUT_FENCE_PTR");
+		int64_t fmts_blob  = get_property_value(fd, out->wb_connector.props, "WRITEBACK_PIXEL_FORMATS");
+		if (fb_prop < 0 || fence_prop < 0) {
+			modeset_drm_object_fini(&out->wb_connector);
+			out->wb_connector.props = NULL;
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
+        bool has_nv12 = false;
+		if (fmts_blob > 0) {
+			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(fd, (uint32_t)fmts_blob);
+			if (blob && blob->data) {
+				const uint32_t *fmts = (const uint32_t *)blob->data;
+				int n = blob->length / sizeof(uint32_t);
+                for (int k = 0; k < n; k++)
+                    if (fmts[k] == DRM_FORMAT_NV12) { has_nv12 = true; break; }
+			}
+			if (blob)
+				drmModeFreePropertyBlob(blob);
+		}
+        if (!has_nv12) {
+			// Do not guess a format the connector did not advertise: the commit would fail later
+			// with an opaque EINVAL instead of here, where the cause is obvious.
+            fprintf(stdout, "Writeback: connector %u does not advertise NV12\n",
+				conn->connector_id);
+			modeset_drm_object_fini(&out->wb_connector);
+			out->wb_connector.props = NULL;
+			drmModeFreeConnector(conn);
+			continue;
+		}
+		out->wb_available = true;
+
+        fprintf(stdout, "Writeback connector %u available for CRTC %u, output format NV12\n",
+            conn->connector_id, out->crtc.id);
+		drmModeFreeConnector(conn);
+	}
+
+	drmModeFreeResources(res);
+	if (!out->wb_available)
+		fprintf(stdout, "No usable DRM writeback connector for CRTC %u\n", out->crtc.id);
+	return out->wb_available ? 0 : -ENOENT;
+}
+
+int modeset_create_wb_fb(int fd, struct modeset_buf *buf)
+{
+	struct drm_mode_create_dumb creq;
+	struct drm_mode_destroy_dumb dreq;
+	int ret;
+	uint32_t handles[4] = {0}, pitches[4] = {0}, offsets[4] = {0};
+
+	buf->prime_fd = -1;
+	buf->map = NULL;
+
+	// Pad the vertical stride to 16 so the MPP encoder (which aligns ver_stride) reads the CbCr
+	// plane / trailing rows from the same offset the buffer is laid out at. The FB is added at the
+	// true display height; the VOP writes only those rows.
+	uint32_t ver = (buf->height + 15) & ~15u;
+
+    memset(&creq, 0, sizeof(creq));
+    creq.width  = buf->width;
+    creq.height = ver * 3 / 2;
+    creq.bpp    = 8;
+    ret = drmIoctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq);
+    if (ret < 0) {
+        fprintf(stderr, "cannot create NV12 wb buffer (%d): %m\n", errno);
+        return -errno;
+    }
+    buf->stride = creq.pitch;
+    buf->size   = creq.size;
+    buf->handle = creq.handle;
+
+    handles[0] = buf->handle; pitches[0] = buf->stride; offsets[0] = 0;
+    handles[1] = buf->handle; pitches[1] = buf->stride; offsets[1] = buf->stride * ver;
+    ret = drmModeAddFB2(fd, buf->width, buf->height, DRM_FORMAT_NV12,
+                handles, pitches, offsets, &buf->fb, 0);
+
+	if (ret) {
+		fprintf(stderr, "cannot create wb framebuffer (%d): %m\n", errno);
+		ret = -errno;
+		goto err_destroy;
+	}
+
+	ret = drmPrimeHandleToFD(fd, buf->handle, DRM_CLOEXEC | DRM_RDWR, &buf->prime_fd);
+	if (ret) {
+		fprintf(stderr, "cannot export wb prime fd (%d): %m\n", errno);
+		ret = -errno;
+		goto err_fb;
+	}
+	return 0;
+
+err_fb:
+	drmModeRmFB(fd, buf->fb);
+err_destroy:
+	memset(&dreq, 0, sizeof(dreq));
+	dreq.handle = buf->handle;
+	drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+	return ret;
+}
+
+void modeset_destroy_wb_fb(int fd, struct modeset_buf *buf)
+{
+	struct drm_mode_destroy_dumb dreq;
+
+	if (buf->prime_fd >= 0) {
+		close(buf->prime_fd);
+		buf->prime_fd = -1;
+	}
+	if (buf->fb)
+		drmModeRmFB(fd, buf->fb);
+	if (buf->handle) {
+		memset(&dreq, 0, sizeof(dreq));
+		dreq.handle = buf->handle;
+		drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+	}
+}
+
+int modeset_arm_writeback(struct modeset_output *out, drmModeAtomicReq *req, uint32_t wb_fb, int32_t *out_fence_ptr)
+{
+    if (!out->wb_enabled)
+		return -1;
+	if (set_drm_object_property(req, &out->wb_connector, "WRITEBACK_FB_ID", wb_fb) < 0)
+		return -1;
+	if (set_drm_object_property(req, &out->wb_connector, "WRITEBACK_OUT_FENCE_PTR",
+				    (uint64_t)(uintptr_t)out_fence_ptr) < 0)
+		return -1;
+	return 0;
+}
+
+int modeset_attach_writeback(int fd, struct modeset_output *out)
+{
+    drmModeAtomicReq *req;
+    struct modeset_buf *buf;
+    int64_t zpos;
+    int ret;
+
+    if (!out->wb_available)
+        return -ENODEV;
+    if (out->wb_enabled)
+        return 0;
+
+    out->wb_enabled = true;
+
+    req = drmModeAtomicAlloc();
+    if (!req) {
+        out->wb_enabled = false;
+        return -ENOMEM;
+    }
+
+    buf = &out->osd_bufs[0];
+    zpos = get_property_value(fd, out->osd_plane.props, "zpos");
+    ret = modeset_perform_modeset(fd, out, req, &out->osd_plane, buf->fb,
+                        buf->width, buf->height, (int)zpos);
+    drmModeAtomicFree(req);
+
+    if (ret < 0) {
+        fprintf(stderr, "writeback attach modeset failed (%d): %m\n", ret);
+        out->wb_enabled = false;
+        return ret;
+    }
+    fprintf(stdout, "Writeback connector %u attached to CRTC %u (persistent)\n",
+        out->wb_connector.id, out->crtc.id);
+    return 0;
+}
+
+void modeset_detach_writeback(int fd, struct modeset_output *out)
+{
+    drmModeAtomicReq *req;
+
+    if (!out->wb_available)
+        return;
+
+    out->wb_enabled = false;
+
+    req = drmModeAtomicAlloc();
+    if (!req)
+        return;
+    if (set_drm_object_property(req, &out->wb_connector, "CRTC_ID", 0) > 0) {
+        if (drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL) < 0)
+            fprintf(stderr, "writeback detach commit failed: %m\n");
+    }
+    drmModeAtomicFree(req);
+}
+
+int modeset_check_writeback(int fd, struct modeset_output *out, uint32_t wb_fb)
+{
+    drmModeAtomicReq *req;
+    int32_t dummy_fence = -1;
+    int ret;
+
+    req = drmModeAtomicAlloc();
+    if (!req)
+        return -ENOMEM;
+    if (set_drm_object_property(req, &out->osd_plane, "FB_ID", out->osd_bufs[0].fb) < 0) {
+        drmModeAtomicFree(req);
+        return -EINVAL;
+    }
+    ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+    drmModeAtomicFree(req);
+    if (ret < 0) {
+        fprintf(stderr, "writeback idle-commit check failed (%d): %m - this kernel appears to "
+            "require a writeback job on every commit\n", ret);
+        return ret;
+	}
+
+    req = drmModeAtomicAlloc();
+    if (!req)
+        return -ENOMEM;
+    if (set_drm_object_property(req, &out->osd_plane, "FB_ID", out->osd_bufs[0].fb) < 0 ||
+        modeset_arm_writeback(out, req, wb_fb, &dummy_fence) < 0) {
+        drmModeAtomicFree(req);
+        return -EINVAL;
+    }
+    ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_TEST_ONLY, NULL);
+    drmModeAtomicFree(req);
+    if (ret < 0) {
+        fprintf(stderr, "writeback capture-commit check failed (%d): %m\n", ret);
+        return ret;
+    }
+    return 0;
+}
 
 int modeset_setup_framebuffers(int fd, drmModeConnector *conn, struct modeset_output *out)
 {
@@ -684,6 +972,10 @@ int modeset_atomic_prepare_commit(int fd, struct modeset_output *out, drmModeAto
 {
 	if (set_drm_object_property(req, &out->connector, "CRTC_ID", out->crtc.id) < 0)
 		return -1;
+	if (out->wb_enabled) {
+		if (set_drm_object_property(req, &out->wb_connector, "CRTC_ID", out->crtc.id) < 0)
+			return -1;
+	}
 	if (set_drm_object_property(req, &out->crtc, "MODE_ID", out->mode_blob_id) < 0)
 		return -1;
 	if (set_drm_object_property(req, &out->crtc, "ACTIVE", 1) < 0)
@@ -731,6 +1023,19 @@ void restore_planes_zpos(int fd, struct modeset_output *output_list) {
 	// restore osd zpos
 	int ret, flags;
 	struct modeset_buf *buf = &output_list->osd_bufs[0];
+
+	// Start from empty requests. These objects are the ones the display/OSD threads were filling
+	// per frame, and they still carry every property from the last frame those threads built - for
+	// video_request that can include WRITEBACK_FB_ID naming a writeback buffer that has since been
+	// removed by cleanup_writeback(), which makes the commit below fail with EINVAL.
+	drmModeAtomicFree(output_list->osd_request);
+	output_list->osd_request = drmModeAtomicAlloc();
+	drmModeAtomicFree(output_list->video_request);
+	output_list->video_request = drmModeAtomicAlloc();
+	if (!output_list->osd_request || !output_list->video_request) {
+		fprintf(stderr, "restore_planes_zpos: cannot allocate atomic requests\n");
+		return;
+	}
 
 	// TODO(geehe) Find a more elegant way to do this.
 	int64_t zpos = get_property_value(fd, output_list->osd_plane.props, "zpos");

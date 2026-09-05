@@ -18,8 +18,15 @@ set(SOURCE_FILES
         src/rtp_codec_detector.cpp
         src/rtp_receiver.hpp
         src/rtp_receiver.cpp
-        src/dvr.h
-        src/dvr.cpp
+        src/dvr/dvr_common.h
+        src/dvr/mpp_encoder.h
+        src/dvr/mpp_encoder.cpp
+        src/dvr/ts_writer.h
+        src/dvr/ts_writer.cpp
+        src/dvr/storage_guard.h
+        src/dvr/storage_guard.cpp
+        src/dvr/dvr.h
+        src/dvr/dvr.cpp
         src/mavlink.h
         src/mavlink.c
         src/main.cpp
@@ -35,7 +42,6 @@ file(GLOB OSD_CONFIGS *_osd.json)
 # Autodetect include/library paths for target system
 find_package(PkgConfig REQUIRED)
 
-pkg_check_modules(LIBRGA REQUIRED IMPORTED_TARGET librga)
 pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
 pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
@@ -57,7 +63,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE m rtp
         PkgConfig::NLOHMANN
         PkgConfig::MSGPACK
         rockchip_mpp pthread m rt
-        PkgConfig::LIBRGA
 )
 
 if(CMAKE_BUILD_TYPE MATCHES "Debug")

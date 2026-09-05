@@ -43,10 +43,10 @@ public:
 
     void rtp_receiver_thread();
     VideoCodec get_video_codec();
-    bool new_codec_detected();
     NEW_FRAME_CALLBACK m_cb;
 private:
     VideoCodec m_video_codec = VideoCodec::UNKNOWN;
+    int m_codec_mismatch_count = 0;
     int m_socket;
 
     std::shared_ptr<std::atomic<bool>> m_running;
