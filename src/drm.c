@@ -927,6 +927,11 @@ struct modeset_output *modeset_prepare(int fd, uint16_t mode_width, uint16_t mod
 			continue;
 		}
 
+		if (conn->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+			drmModeFreeConnector(conn);
+			continue;
+		}
+
 		out = modeset_output_create(fd, res, conn, mode_width, mode_height, mode_vrefresh, target_frame_rate);
 		drmModeFreeConnector(conn);
 		if (out) {
